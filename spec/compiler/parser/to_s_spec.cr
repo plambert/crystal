@@ -10,15 +10,15 @@ private def expect_to_s(original, expected = original, emit_doc = false, file = 
       parser.wants_doc = emit_doc
       node = parser.parse
       node.to_s(str, emit_doc: emit_doc)
-      str.to_s.should eq(expected), file, line
+      str.to_s.should eq(expected), file: file, line: line
 
       # Check keeping information for `to_s` on clone
       cloned = node.clone
       str.clear
       cloned.to_s(str, emit_doc: emit_doc)
-      str.to_s.should eq(expected), file, line
+      str.to_s.should eq(expected), file: file, line: line
     else
-      source.to_s.should eq(expected), file, line
+      source.to_s.should eq(expected), file: file, line: line
     end
   end
 end
@@ -170,4 +170,6 @@ describe "ASTNode#to_s" do
   expect_to_s "offsetof(Foo, @bar)"
   expect_to_s "def foo(**options, &block)\nend"
   expect_to_s "macro foo\n  123\nend"
+  expect_to_s "if true\n(  1)\nend"
+  expect_to_s "begin\n(  1)\nrescue\nend"
 end

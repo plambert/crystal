@@ -18,11 +18,11 @@ describe "Set" do
       set_from_array.size.should eq(3)
       set_from_array.to_a.sort.should eq([2, 4, 6])
 
-      set_from_tulpe = Set.new({1, "hello", 'x'})
-      set_from_tulpe.size.should eq(3)
-      set_from_tulpe.to_a.includes?(1).should be_true
-      set_from_tulpe.to_a.includes?("hello").should be_true
-      set_from_tulpe.to_a.includes?('x').should be_true
+      set_from_tuple = Set.new({1, "hello", 'x'})
+      set_from_tuple.size.should eq(3)
+      set_from_tuple.to_a.includes?(1).should be_true
+      set_from_tuple.to_a.includes?("hello").should be_true
+      set_from_tuple.to_a.includes?('x').should be_true
     end
   end
 
@@ -63,9 +63,14 @@ describe "Set" do
       set.includes?(3).should be_true
     end
 
-    it "returns self" do
+    it "returns true when the object was present" do
       set = Set{1, 2, 3}
-      set.delete(2).should eq(set)
+      set.delete(2).should be_true
+    end
+
+    it "returns false when the object was absent" do
+      set = Set{1, 2, 3}
+      set.delete(0).should be_false
     end
   end
 
@@ -349,6 +354,20 @@ describe "Set" do
     empty_set.subset?(empty_set).should be_true
   end
 
+  it "#subset_of?" do
+    set = Set{1, 2, 3}
+    empty_set = Set(Int32).new
+
+    set.subset_of?(Set{1, 2, 3, 4}).should be_true
+    set.subset_of?(Set{1, 2, 3, "4"}).should be_true
+    set.subset_of?(Set{1, 2, 3}).should be_true
+    set.subset_of?(Set{1, 2}).should be_false
+    set.subset_of?(empty_set).should be_false
+
+    empty_set.subset_of?(Set{1}).should be_true
+    empty_set.subset_of?(empty_set).should be_true
+  end
+
   it "check proper_subset" do
     set = Set{1, 2, 3}
     empty_set = Set(Int32).new
@@ -361,6 +380,20 @@ describe "Set" do
 
     empty_set.proper_subset?(Set{1}).should be_true
     empty_set.proper_subset?(empty_set).should be_false
+  end
+
+  it "#proper_subset_of?" do
+    set = Set{1, 2, 3}
+    empty_set = Set(Int32).new
+
+    set.proper_subset_of?(Set{1, 2, 3, 4}).should be_true
+    set.proper_subset_of?(Set{1, 2, 3, "4"}).should be_true
+    set.proper_subset_of?(Set{1, 2, 3}).should be_false
+    set.proper_subset_of?(Set{1, 2}).should be_false
+    set.proper_subset_of?(empty_set).should be_false
+
+    empty_set.proper_subset_of?(Set{1}).should be_true
+    empty_set.proper_subset_of?(empty_set).should be_false
   end
 
   it "check superset" do
@@ -377,6 +410,20 @@ describe "Set" do
     empty_set.superset?(empty_set).should be_true
   end
 
+  it "#superset_of?" do
+    set = Set{1, 2, "3"}
+    empty_set = Set(Int32).new
+
+    set.superset_of?(empty_set).should be_true
+    set.superset_of?(Set{1, 2}).should be_true
+    set.superset_of?(Set{1, 2, "3"}).should be_true
+    set.superset_of?(Set{1, 2, 3}).should be_false
+    set.superset_of?(Set{1, 2, 3, 4}).should be_false
+    set.superset_of?(Set{1, 4}).should be_false
+
+    empty_set.superset_of?(empty_set).should be_true
+  end
+
   it "check proper_superset" do
     set = Set{1, 2, "3"}
     empty_set = Set(Int32).new
@@ -389,6 +436,20 @@ describe "Set" do
     set.proper_superset?(Set{1, 4}).should be_false
 
     empty_set.proper_superset?(empty_set).should be_false
+  end
+
+  it "#proper_superset_of?" do
+    set = Set{1, 2, "3"}
+    empty_set = Set(Int32).new
+
+    set.proper_superset_of?(empty_set).should be_true
+    set.proper_superset_of?(Set{1, 2}).should be_true
+    set.proper_superset_of?(Set{1, 2, "3"}).should be_false
+    set.proper_superset_of?(Set{1, 2, 3}).should be_false
+    set.proper_superset_of?(Set{1, 2, 3, 4}).should be_false
+    set.proper_superset_of?(Set{1, 4}).should be_false
+
+    empty_set.proper_superset_of?(empty_set).should be_false
   end
 
   it "has object_id" do

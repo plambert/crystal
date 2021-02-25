@@ -546,4 +546,88 @@ describe "Semantic: automatic cast" do
       fill()
       )) { types["AnotherColor"] }
   end
+
+  it "doesn't do multidispatch if an overload matches exactly (#8217)" do
+    assert_type(%(
+      abstract class Foo
+      end
+
+      class Bar < Foo
+        def foo(x : Int64)
+          x
+        end
+
+        def foo(*xs : Int64)
+          xs
+        end
+      end
+
+      class Baz < Foo
+        def foo(x : Int64)
+          x
+        end
+
+        def foo(*xs : Int64)
+          xs
+        end
+      end
+
+      Baz.new.as(Foo).foo(1)
+      )) { int64 }
+  end
+
+  it "doesn't autocast number on union (#8655)" do
+    assert_type(%(
+      def foo(x : UInt8 | Int32, y : Float64)
+        x
+      end
+
+      foo(255, 60)
+      )) { int32 }
+  end
+
+  it "says ambiguous call on union (#8655)" do
+    assert_error %(
+      def foo(x : UInt64 | Int64, y : Float64)
+        x
+      end
+
+      foo(255, 60)
+      ),
+      "ambiguous call, implicit cast of 255 matches all of UInt64, Int64"
+  end
+
+  it "autocasts nested type from non-nested type (#10315)" do
+    assert_no_errors(%(
+      module Moo
+        enum Color
+          Red
+        end
+
+        abstract class Foo
+          def initialize(color : Color = :red)
+          end
+        end
+      end
+
+      class Bar < Moo::Foo
+      end
+
+      Bar.new
+      ))
+  end
+
+  it "errors when autocast default value doesn't match enum member" do
+    assert_error <<-CR,
+      enum Foo
+        FOO
+      end
+
+      def foo(foo : Foo = :bar)
+      end
+
+      foo
+      CR
+      "can't autocast :bar to Foo: no matching enum member"
+  end
 end

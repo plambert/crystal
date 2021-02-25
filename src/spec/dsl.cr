@@ -54,6 +54,10 @@ module Spec
   end
 
   # :nodoc:
+  class ExamplePending < SpecError
+  end
+
+  # :nodoc:
   class NestingSpecError < SpecError
   end
 
@@ -268,6 +272,11 @@ module Spec
       maybe_randomize
       run_filters
       root_context.run
+    rescue ex
+      STDERR.print "Unhandled exception: "
+      ex.inspect_with_backtrace(STDERR)
+      STDERR.flush
+      @@aborted = true
     ensure
       finish_run
     end

@@ -259,7 +259,7 @@ abstract class IO
   end
 
   # Writes a formatted string to this IO.
-  # For details on the format string, see `Kernel::sprintf`.
+  # For details on the format string, see top-level `::printf`.
   def printf(format_string, *args) : Nil
     printf format_string, args
   end
@@ -1099,7 +1099,7 @@ abstract class IO
   # `File` and `IO::Memory` implement it.
   #
   # Multiple sections can be read concurrently.
-  def read_at(offset, bytesize, &block)
+  def read_at(offset, bytesize, & : IO ->)
     raise Error.new "Unable to read_at"
   end
 
