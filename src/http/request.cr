@@ -1,7 +1,6 @@
 require "./common"
 require "uri"
 require "http/params"
-require "openssl"
 
 # An HTTP request.
 #
@@ -63,21 +62,6 @@ class HTTP::Request
     property local_address : Nil
   {% end %}
 
-  # The network address that received the request to an HTTP server.
-  #
-  # `HTTP::Server` will try to fill this property, and its value
-  # will have a format like "IP:port", but this format is not guaranteed.
-  # Middlewares can overwrite this value.
-  #
-  # This property is not used by `HTTP::Client`.
-  property local_address : RemoteAddressType
-
-  # Was the socket where the request was received a TLS connection?
-  # Middlewares can overwrite this value.
-  #
-  # This property is not used by `HTTP::Client`.
-  property is_tls : Bool = false
-
   def self.new(method : String, resource : String, headers : Headers? = nil, body : String | Bytes | IO | Nil = nil, version = "HTTP/1.1")
     # Duplicate headers to prevent the request from modifying data that the user might hold.
     new(method, resource, headers.try(&.dup), body, version, internal: nil)
@@ -111,10 +95,6 @@ class HTTP::Request
 
   def ignore_body? : Bool
     @method == "HEAD"
-  end
-
-  def is_tls?
-    @is_tls
   end
 
   def content_length=(length : Int)
@@ -168,13 +148,6 @@ class HTTP::Request
 
       if io.responds_to?(:local_address)
         request.local_address = io.local_address
-      end
-
-      case io
-      when OpenSSL::SSL::Server
-        request.is_tls = true
-      else
-        request.is_tls = false
       end
 
       return request
