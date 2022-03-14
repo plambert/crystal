@@ -207,19 +207,31 @@ class IO::Memory < IO
     @pos = @bytesize
   end
 
+  # :inherit:
   def gets_to_end : String
     return super if @encoding
 
     check_open
 
-    pos = Math.min(@pos, @bytesize)
-
-    if pos == @bytesize
+    if @pos >= @bytesize
       ""
     else
-      String.new(@buffer + @pos, @bytesize - @pos).tap do
-        @pos = @bytesize
-      end
+      str = String.new(@buffer + @pos, @bytesize - @pos)
+      @pos = @bytesize
+      str
+    end
+  end
+
+  # :inherit:
+  def getb_to_end : Bytes
+    check_open
+
+    if @pos >= @bytesize
+      Bytes.new(0)
+    else
+      bytes = Slice.new(@buffer + @pos, @bytesize - @pos).dup
+      @pos = @bytesize
+      bytes
     end
   end
 
@@ -409,6 +421,12 @@ class IO::Memory < IO
 
   # Appends this internal buffer to the given `IO`.
   def to_s(io : IO) : Nil
+    if io == self
+      # When appending to itself, we need to pull the resize up before taking
+      # pointer to the buffer. It would become invalid when a resize happens during `#write`.
+      new_bytesize = bytesize * 2
+      resize_to_capacity(new_bytesize) if @capacity < new_bytesize
+    end
     io.write(to_slice)
   end
 
