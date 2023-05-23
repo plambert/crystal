@@ -18,6 +18,20 @@ struct StructIter
   end
 end
 
+private class MockIterator
+  include Iterator(Int32)
+
+  def initialize
+    @x = 0
+    @y = Slice(Int32).new(5)
+  end
+
+  def next
+    return stop if @x >= 3
+    @x += 1
+  end
+end
+
 describe Iterator do
   describe "Iterator.of" do
     it "creates singleton" do
@@ -149,6 +163,11 @@ describe Iterator do
       iter.next.should eq('a')
       iter.next.should eq('b')
       iter.next.should be_a(Iterator::Stop)
+    end
+
+    # NOTE: This spec would only fail in release mode.
+    it "does not experience tuple upcase bug of #13411" do
+      [{true}].each.chain([{1}].each).first(3).to_a.should eq [{true}, {1}]
     end
 
     describe "chain indeterminate number of iterators" do
@@ -527,6 +546,10 @@ describe Iterator do
       iter.next.should eq([7, 8])
       iter.next.should be_a(Iterator::Stop)
     end
+
+    it "doesnt conflict with `::Slice` type" do
+      assert_iterates_iterator [1, 2, 3], MockIterator.new.each
+    end
   end
 
   describe "step" do
@@ -738,13 +761,13 @@ describe Iterator do
 
   describe "flatten" do
     it "flattens an iterator of mixed-type iterators" do
-      iter = [(1..2).each, ('a'..'b').each, {:c => 3}.each].each.flatten
+      iter = [(1..2).each, ('a'..'b').each, {"c" => 3}.each].each.flatten
 
       iter.next.should eq(1)
       iter.next.should eq(2)
       iter.next.should eq('a')
       iter.next.should eq('b')
-      iter.next.should eq({:c, 3})
+      iter.next.should eq({"c", 3})
 
       iter.next.should be_a(Iterator::Stop)
     end

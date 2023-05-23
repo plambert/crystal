@@ -147,7 +147,7 @@ class Dir
 
     private def self.constant_entry?(file)
       file.each_char do |char|
-        return false if char == '*' || char == '?'
+        return false if char.in?('*', '?')
       end
 
       true
@@ -176,10 +176,10 @@ class Dir
         next_pos = pos - 1
         case cmd
         in RootDirectory
-          raise "unreachable" if path
+          raise "Unreachable" if path
           path_stack << {next_pos, root, nil}
         in DirectoriesOnly
-          raise "unreachable" unless path
+          raise "Unreachable" unless path
           # FIXME: [win32] File::SEPARATOR_STRING comparison is not sufficient for Windows paths.
           if path == File::SEPARATOR_STRING
             fullpath = path
@@ -322,10 +322,10 @@ class Dir
       File.join(path, entry)
     end
 
-    private def self.each_child(path)
+    private def self.each_child(path, &)
       Dir.open(path || Dir.current) do |dir|
         while entry = read_entry(dir)
-          next if entry.name == "." || entry.name == ".."
+          next if entry.name.in?(".", "..")
           yield entry
         end
       end

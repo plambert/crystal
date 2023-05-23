@@ -5,13 +5,13 @@ lib LibC
 
   DT_UNKNOWN =  0
   DT_DIR     =  4
-  DT_LINK    = 10
+  DT_LNK     = 10
 
   struct Dirent
     d_ino : InoT
     d_off : OffT
     d_reclen : UShort
-    d_type : Char
+    d_type : UChar
     d_name : StaticArray(Char, 256)
   end
 

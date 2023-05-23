@@ -203,9 +203,10 @@ describe "String" do
     end
   end
 
-  describe "byte_slice" do
+  describe "#byte_slice" do
     it "gets byte_slice" do
       "hello".byte_slice(1, 3).should eq("ell")
+      "hello".byte_slice(1..3).should eq("ell")
     end
 
     it "gets byte_slice with negative count" do
@@ -224,14 +225,19 @@ describe "String" do
       expect_raises(IndexError) do
         "hello".byte_slice(10, 3)
       end
+      expect_raises(IndexError) do
+        "hello".byte_slice(10..13)
+      end
     end
 
     it "gets byte_slice with large count" do
       "hello".byte_slice(1, 10).should eq("ello")
+      "hello".byte_slice(1..10).should eq("ello")
     end
 
     it "gets byte_slice with negative index" do
       "hello".byte_slice(-2, 3).should eq("lo")
+      "hello".byte_slice(-2..-1).should eq("lo")
     end
 
     it "gets byte_slice(Int) with start out of bounds" do
@@ -241,6 +247,45 @@ describe "String" do
       expect_raises(IndexError) do
         "hello".byte_slice(-10)
       end
+    end
+  end
+
+  describe "#byte_slice?" do
+    it "gets byte_slice" do
+      "hello".byte_slice?(1, 3).should eq("ell")
+      "hello".byte_slice?(1..3).should eq("ell")
+    end
+
+    it "gets byte_slice with negative count" do
+      expect_raises(ArgumentError) do
+        "hello".byte_slice?(1, -10)
+      end
+    end
+
+    it "gets byte_slice with negative count at last" do
+      expect_raises(ArgumentError) do
+        "hello".byte_slice?(5, -1)
+      end
+    end
+
+    it "gets byte_slice with start out of bounds" do
+      "hello".byte_slice?(10, 3).should be_nil
+      "hello".byte_slice?(10..13).should be_nil
+    end
+
+    it "gets byte_slice with large count" do
+      "hello".byte_slice?(1, 10).should eq("ello")
+      "hello".byte_slice?(1..11).should eq("ello")
+    end
+
+    it "gets byte_slice with negative index" do
+      "hello".byte_slice?(-2, 3).should eq("lo")
+      "hello".byte_slice?(-2..-1).should eq("lo")
+    end
+
+    it "gets byte_slice(Int) with start out of bounds" do
+      "hello".byte_slice?(10).should be_nil
+      "hello".byte_slice?(-10).should be_nil
     end
   end
 
@@ -390,12 +435,12 @@ describe "String" do
     end
 
     describe "to_u64" do
-      it { "18446744073709551615".to_u64.should eq(18446744073709551615) }
+      it { "18446744073709551615".to_u64.should eq(18446744073709551615u64) }
       it { "0".to_u64.should eq(0) }
       it { expect_raises(ArgumentError) { "18446744073709551616".to_u64 } }
       it { expect_raises(ArgumentError) { "-1".to_u64 } }
 
-      it { "18446744073709551615".to_u64?.should eq(18446744073709551615) }
+      it { "18446744073709551615".to_u64?.should eq(18446744073709551615u64) }
       it { "18446744073709551616".to_u64?.should be_nil }
       it { "18446744073709551616".to_u64 { 0 }.should eq(0) }
     end
@@ -824,7 +869,7 @@ describe "String" do
     it { "bcdaaa".strip('a').should eq("bcd") }
     it { "aaabcd".strip('a').should eq("bcd") }
 
-    it { "ababcdaba".strip { |c| c == 'a' || c == 'b' }.should eq("cd") }
+    it { "ababcdaba".strip(&.in?('a', 'b')).should eq("cd") }
   end
 
   describe "rstrip" do
@@ -845,7 +890,7 @@ describe "String" do
     it { "foobarrrr".rstrip('r').should eq("fooba") }
     it { "foobar".rstrip('x').should eq("foobar") }
 
-    it { "foobar".rstrip { |c| c == 'a' || c == 'r' }.should eq("foob") }
+    it { "foobar".rstrip(&.in?('a', 'r')).should eq("foob") }
 
     it "does not touch invalid code units in an otherwise ascii string" do
       " \xA0 ".rstrip.should eq(" \xA0")
@@ -869,7 +914,7 @@ describe "String" do
     it { "bbbbarfoo".lstrip('b').should eq("arfoo") }
     it { "barfoo".lstrip('x').should eq("barfoo") }
 
-    it { "barfoo".lstrip { |c| c == 'a' || c == 'b' }.should eq("rfoo") }
+    it { "barfoo".lstrip(&.in?('a', 'b')).should eq("rfoo") }
 
     it "does not touch invalid code units in an otherwise ascii string" do
       " \xA0 ".lstrip.should eq("\xA0 ")
@@ -967,6 +1012,78 @@ describe "String" do
     end
   end
 
+  describe "#index!" do
+    describe "by char" do
+      it { "foo".index!('o').should eq(1) }
+      it do
+        expect_raises(Enumerable::NotFoundError) do
+          "foo".index!('g')
+        end
+      end
+
+      describe "with offset" do
+        it { "foobarbaz".index!('a', 5).should eq(7) }
+        it { "foobarbaz".index!('a', -4).should eq(7) }
+        it do
+          expect_raises(Enumerable::NotFoundError) do
+            "foo".index!('f', 1)
+          end
+        end
+        it do
+          expect_raises(Enumerable::NotFoundError) do
+            "foo".index!('g', -20)
+          end
+        end
+      end
+    end
+
+    describe "by string" do
+      it { "foo bar".index!("o b").should eq(2) }
+      it { "foo".index!("").should eq(0) }
+      it { "foo".index!("foo").should eq(0) }
+      it do
+        expect_raises(Enumerable::NotFoundError) do
+          "foo".index!("fg")
+        end
+      end
+
+      describe "with offset" do
+        it { "foobarbaz".index!("ba", 4).should eq(6) }
+        it { "foobarbaz".index!("ba", -5).should eq(6) }
+        it do
+          expect_raises(Enumerable::NotFoundError) do
+            "foo".index!("ba", 1)
+          end
+        end
+        it do
+          expect_raises(Enumerable::NotFoundError) do
+            "foo".index!("ba", -20)
+          end
+        end
+      end
+    end
+
+    describe "by regex" do
+      it { "string 12345".index!(/\d+/).should eq(7) }
+      it { "12345".index!(/\d/).should eq(0) }
+      it do
+        expect_raises(Enumerable::NotFoundError) do
+          "Hello, world!".index!(/\d/)
+        end
+      end
+
+      describe "with offset" do
+        it { "abcDef".index!(/[A-Z]/).should eq(3) }
+        it { "foobarbaz".index!(/ba/, -5).should eq(6) }
+        it do
+          expect_raises(Enumerable::NotFoundError) do
+            "Foo".index!(/[A-Z]/, 1)
+          end
+        end
+      end
+    end
+  end
+
   describe "#rindex" do
     describe "by char" do
       it { "bbbb".rindex('b').should eq(3) }
@@ -1043,6 +1160,70 @@ describe "String" do
         it { "bbbb".rindex(/b/, -5).should be_nil }
         it { "bbbb".rindex(/b/, -4).should eq(0) }
         it { "日本語日本語".rindex(/日本/, 2).should eq(0) }
+      end
+    end
+  end
+
+  describe "#rindex!" do
+    describe "by char" do
+      it { "bbbb".rindex!('b').should eq(3) }
+      it { "foobar".rindex!('a').should eq(4) }
+      it do
+        expect_raises(Enumerable::NotFoundError) do
+          "foobar".rindex!('g')
+        end
+      end
+
+      describe "with offset" do
+        it { "bbbb".rindex!('b', 2).should eq(2) }
+        it do
+          expect_raises(Enumerable::NotFoundError) do
+            "abbbb".rindex!('b', 0)
+          end
+        end
+      end
+    end
+
+    describe "by string" do
+      it { "bbbb".rindex!("b").should eq(3) }
+      it { "foo baro baz".rindex!("o b").should eq(7) }
+      it do
+        expect_raises(Enumerable::NotFoundError) do
+          "foo baro baz".rindex!("fg")
+        end
+      end
+
+      describe "with offset" do
+        it { "bbbb".rindex!("b", 2).should eq(2) }
+        it do
+          expect_raises(Enumerable::NotFoundError) do
+            "abbbb".rindex!("b", 0)
+          end
+        end
+        it do
+          expect_raises(Enumerable::NotFoundError) do
+            "bbbb".rindex!("b", -5)
+          end
+        end
+      end
+    end
+
+    describe "by regex" do
+      it { "bbbb".rindex!(/b/).should eq(3) }
+      it { "a43b53".rindex!(/\d+/).should eq(4) }
+      it do
+        expect_raises(Enumerable::NotFoundError) do
+          "bbbb".rindex!(/\d/)
+        end
+      end
+
+      describe "with offset" do
+        it { "bbbb".rindex!(/b/, 2).should eq(2) }
+        it do
+          expect_raises(Enumerable::NotFoundError) do
+            "abbbb".rindex!(/b/, 0)
+          end
+        end
       end
     end
   end
@@ -1332,7 +1513,7 @@ describe "String" do
     end
 
     it "subs char with string" do
-      replaced = "foobar".sub do |char|
+      "foobar".sub do |char|
         char.should eq 'f'
         "some"
       end.should eq("someoobar")
@@ -1553,7 +1734,7 @@ describe "String" do
     end
   end
 
-  describe "gsub" do
+  describe "#gsub" do
     it "gsubs char with char" do
       "foobar".gsub('o', 'e').should eq("feebar")
     end
@@ -1729,6 +1910,16 @@ describe "String" do
     it "ignores if backreferences: false" do
       "foo".gsub(/o/, "x\\0x", backreferences: false).should eq("fx\\0xx\\0x")
     end
+
+    it "empty match" do
+      "a  b".gsub(/\B/, "-").should eq "a - b"
+      "┬  7".gsub(/\B/, "-").should eq "-┬- - 7"
+    end
+
+    it "empty string" do
+      "ab".gsub("", "-").should eq "-a-b-"
+      "┬7".gsub("", "-").should eq "-┬-7-"
+    end
   end
 
   it "scans using $~" do
@@ -1854,124 +2045,6 @@ describe "String" do
       str1 = ""
       str2 = "foo"
       (str1 + str2).should be(str2)
-    end
-  end
-
-  it "does %" do
-    ("foo" % 1).should eq("foo")
-    ("foo %d" % 1).should eq("foo 1")
-    ("%d" % 123).should eq("123")
-    ("%+d" % 123).should eq("+123")
-    ("%+d" % -123).should eq("-123")
-    ("% d" % 123).should eq(" 123")
-    ("%i" % 123).should eq("123")
-    ("%+i" % 123).should eq("+123")
-    ("%+i" % -123).should eq("-123")
-    ("% i" % 123).should eq(" 123")
-    ("%20d" % 123).should eq("                 123")
-    ("%20d" % -123).should eq("                -123")
-    ("%20d" % 0).should eq("                   0")
-    ("%+20d" % 123).should eq("                +123")
-    ("%+20d" % -123).should eq("                -123")
-    ("%+20d" % 0).should eq("                  +0")
-    ("% 20d" % 123).should eq("                 123")
-    ("%020d" % 123).should eq("00000000000000000123")
-    ("%020d" % -123).should eq("0000000000000000-123")
-    ("%020d" % 0).should eq("00000000000000000000")
-    ("%+020d" % 123).should eq("+0000000000000000123")
-    ("%+020d" % -123).should eq("-0000000000000000123")
-    ("%+020d" % 0).should eq("+0000000000000000000")
-    ("% 020d" % 123).should eq(" 0000000000000000123")
-    ("% 020d" % 0).should eq(" 0000000000000000000")
-    ("%-d" % 123).should eq("123")
-    ("%-d" % 0).should eq("0")
-    ("%-20d" % 123).should eq("123                 ")
-    ("%-20d" % -123).should eq("-123                ")
-    ("%-20d" % 0).should eq("0                   ")
-    ("%-+20d" % 123).should eq("+123                ")
-    ("%-+20d" % -123).should eq("-123                ")
-    ("%-+20d" % 0).should eq("+0                  ")
-    ("%- 20d" % 123).should eq(" 123                ")
-    ("%- 20d" % -123).should eq("-123                ")
-    ("%- 20d" % 0).should eq(" 0                  ")
-    ("%s" % 'a').should eq("a")
-    ("%-s" % 'a').should eq("a")
-    ("%20s" % 'a').should eq("                   a")
-    ("%-20s" % 'a').should eq("a                   ")
-    ("%*s" % [10, 123]).should eq("       123")
-    ("%*s" % [-10, 123]).should eq("123       ")
-    ("%.5s" % "foo bar baz").should eq("foo b")
-    ("%.*s" % [5, "foo bar baz"]).should eq("foo b")
-    ("%*.*s" % [20, 5, "foo bar baz"]).should eq("               foo b")
-    ("%-*.*s" % [20, 5, "foo bar baz"]).should eq("foo b               ")
-
-    ("%%%d" % 1).should eq("%1")
-    ("foo %d bar %s baz %d goo" % [1, "hello", 2]).should eq("foo 1 bar hello baz 2 goo")
-
-    ("%b" % 123).should eq("1111011")
-    ("%+b" % 123).should eq("+1111011")
-    ("% b" % 123).should eq(" 1111011")
-    ("%-b" % 123).should eq("1111011")
-    ("%10b" % 123).should eq("   1111011")
-    ("%-10b" % 123).should eq("1111011   ")
-
-    ("%o" % 123).should eq("173")
-    ("%+o" % 123).should eq("+173")
-    ("% o" % 123).should eq(" 173")
-    ("%-o" % 123).should eq("173")
-    ("%6o" % 123).should eq("   173")
-    ("%-6o" % 123).should eq("173   ")
-
-    ("%x" % 123).should eq("7b")
-    ("%+x" % 123).should eq("+7b")
-    ("% x" % 123).should eq(" 7b")
-    ("%-x" % 123).should eq("7b")
-    ("%6x" % 123).should eq("    7b")
-    ("%-6x" % 123).should eq("7b    ")
-
-    ("%X" % 123).should eq("7B")
-    ("%+X" % 123).should eq("+7B")
-    ("% X" % 123).should eq(" 7B")
-    ("%-X" % 123).should eq("7B")
-    ("%6X" % 123).should eq("    7B")
-    ("%-6X" % 123).should eq("7B    ")
-
-    ("こんに%xちは" % 123).should eq("こんに7bちは")
-    ("こんに%Xちは" % 123).should eq("こんに7Bちは")
-
-    span = 1.second
-    ("%s" % span).should eq(span.to_s)
-  end
-
-  it "doesn't stop at null character when doing '%'" do
-    ("1\u{0}%i\u{0}3" % 2).should eq("1\u00002\u00003")
-  end
-
-  pending_win32 "does % with floats" do
-    ("%f" % 123).should eq("123.000000")
-
-    ("%g" % 123).should eq("123")
-    ("%12f" % 123.45).should eq("  123.450000")
-    ("%-12f" % 123.45).should eq("123.450000  ")
-    ("% f" % 123.45).should eq(" 123.450000")
-    ("%+f" % 123).should eq("+123.000000")
-    ("%012f" % 123).should eq("00123.000000")
-    ("%.f" % 1234.56).should eq("1235")
-    ("%.2f" % 1234.5678).should eq("1234.57")
-    ("%10.2f" % 1234.5678).should eq("   1234.57")
-    ("%*.2f" % [10, 1234.5678]).should eq("   1234.57")
-    ("%0*.2f" % [10, 1234.5678]).should eq("0001234.57")
-    ("%e" % 123.45).should eq("1.234500e+02")
-    ("%E" % 123.45).should eq("1.234500E+02")
-    ("%G" % 12345678.45).should eq("1.23457E+07")
-    ("%a" % 12345678.45).should eq("0x1.78c29ce666666p+23")
-    ("%A" % 12345678.45).should eq("0X1.78C29CE666666P+23")
-    ("%100.50g" % 123.45).should eq("                                                  123.4500000000000028421709430404007434844970703125")
-
-    ("%.2f" % 2.536_f32).should eq("2.54")
-    ("%0*.*f" % [10, 2, 2.536_f32]).should eq("0000002.54")
-    expect_raises(ArgumentError, "Expected dynamic value '*' to be an Int - \"not a number\" (String)") do
-      "%*f" % ["not a number", 2.536_f32]
     end
   end
 
@@ -2193,7 +2266,7 @@ describe "String" do
     end
   end
 
-  describe "scan" do
+  describe "#scan" do
     it "does without block" do
       a = "cruel world"
       a.scan(/\w+/).map(&.[0]).should eq(["cruel", "world"])
@@ -2229,6 +2302,10 @@ describe "String" do
       r = %r([\s,]*(~@|[\[\]{}()'`~^@]|"(?:\\.|[^\\"])*"|;.*|[^\s\[\]{}('"`,;)]*))
       "hello".scan(r).map(&.[0]).should eq(["hello", ""])
       "hello world".scan(/\w+|(?= )/).map(&.[0]).should eq(["hello", "", "world"])
+    end
+
+    it "works when match is empty, multibyte char" do
+      "\u{80}\u{800}\u{10000}".scan(/()/).map(&.begin).should eq([0, 1, 2, 3])
     end
 
     it "works with strings with block" do
@@ -2391,15 +2468,9 @@ describe "String" do
     end
   end
 
-  it "uses sprintf from top-level" do
-    sprintf("Hello %d world", 123).should eq("Hello 123 world")
-    sprintf("Hello %d world", [123]).should eq("Hello 123 world")
-  end
-
-  pending_win32 "formats floats (#1562)" do
-    sprintf("%12.2f %12.2f %6.2f %.2f" % {2.0, 3.0, 4.0, 5.0}).should eq("        2.00         3.00   4.00 5.00")
-
-    sprintf("%f", 1e15).should eq("1000000000000000.000000")
+  it "does %" do
+    ("Hello %d world" % 123).should eq("Hello 123 world")
+    ("Hello %d world" % [123]).should eq("Hello 123 world")
   end
 
   it "does each_char" do
@@ -2525,79 +2596,64 @@ describe "String" do
     end
   end
 
-  context "%" do
-    it "substitutes one placeholder" do
-      res = "change %{this}" % {"this" => "nothing"}
-      res.should eq "change nothing"
-
-      res = "change %{this}" % {this: "nothing"}
-      res.should eq "change nothing"
+  describe "String.new(&)" do
+    it "creates with matching capacity" do
+      String.new(3) { |buf|
+        buf[0] = 'f'.ord.to_u8
+        buf[1] = 'o'.ord.to_u8
+        buf[2] = 'o'.ord.to_u8
+        {3, 3}
+      }.should eq "foo"
     end
 
-    it "substitutes multiple placeholder" do
-      res = "change %{this} and %{more}" % {"this" => "nothing", "more" => "something"}
-      res.should eq "change nothing and something"
-
-      res = "change %{this} and %{more}" % {this: "nothing", more: "something"}
-      res.should eq "change nothing and something"
+    it "creates with excess capacity" do
+      String.new(5) { |buf|
+        buf[0] = 'f'.ord.to_u8
+        buf[1] = 'o'.ord.to_u8
+        buf[2] = 'o'.ord.to_u8
+        {3, 3}
+      }.should eq "foo"
     end
 
-    it "throws an error when the key is not found" do
-      expect_raises KeyError do
-        "change %{this}" % {"that" => "wrong key"}
-      end
-
-      expect_raises KeyError do
-        "change %{this}" % {that: "wrong key"}
+    it "raises if string capacity is negative" do
+      expect_raises(ArgumentError, "Negative capacity") do
+        String.new(-1) { |buf| {0, 0} }
       end
     end
 
-    it "raises if expecting hash or named tuple but not given" do
-      expect_raises(ArgumentError, "One hash or named tuple required") do
-        "change %{this}" % "this"
+    it "raises if capacity too big with UInt32::MAX" do
+      expect_raises(ArgumentError, "Capacity too big") do
+        String.new(UInt32::MAX) { {0, 0} }
       end
     end
 
-    it "raises on unbalanced curly" do
-      expect_raises(ArgumentError, "Malformed name - unmatched parenthesis") do
-        "change %{this" % {"this" => 1}
+    it "raises if capacity too big with UInt32::MAX - String::HEADER_SIZE - 1" do
+      expect_raises(ArgumentError, "Capacity too big") do
+        String.new(UInt32::MAX - String::HEADER_SIZE) { {0, 0} }
       end
     end
 
-    it "doesn't raise on balanced curly with null byte" do
-      ("change %{this\u{0}}" % {"this\u{0}" => 1}).should eq("change 1")
+    it "raises if capacity too big with UInt64::MAX" do
+      expect_raises(ArgumentError, "Capacity too big") do
+        String.new(UInt64::MAX) { {0, 0} }
+      end
     end
 
-    it "applies formatting to %<...> placeholder" do
-      res = "change %<this>.2f" % {"this" => 23.456}
-      res.should eq "change 23.46"
+    {% unless flag?(:wasm32) %}
+      it "allocates buffer of correct size (#3332)" do
+        String.new(255_u8) do |buffer|
+          LibGC.size(buffer).should be > 255
+          {255, 0}
+        end
+      end
+    {% end %}
 
-      res = "change %<this>.2f" % {this: 23.456}
-      res.should eq "change 23.46"
-    end
-  end
-
-  it "raises if string capacity is negative" do
-    expect_raises(ArgumentError, "Negative capacity") do
-      String.new(-1) { |buf| {0, 0} }
-    end
-  end
-
-  it "raises if capacity too big on new with UInt32::MAX" do
-    expect_raises(ArgumentError, "Capacity too big") do
-      String.new(UInt32::MAX) { {0, 0} }
-    end
-  end
-
-  it "raises if capacity too big on new with UInt32::MAX - String::HEADER_SIZE - 1" do
-    expect_raises(ArgumentError, "Capacity too big") do
-      String.new(UInt32::MAX - String::HEADER_SIZE) { {0, 0} }
-    end
-  end
-
-  it "raises if capacity too big on new with UInt64::MAX" do
-    expect_raises(ArgumentError, "Capacity too big") do
-      String.new(UInt64::MAX) { {0, 0} }
+    it "raises if returned bytesize is greater than capacity" do
+      expect_raises ArgumentError, "Bytesize out of capacity bounds" do
+        String.new(123) do |buffer|
+          {124, 0}
+        end
+      end
     end
   end
 
@@ -2808,23 +2864,6 @@ describe "String" do
     string.should be(clone)
   end
 
-  {% unless flag?(:wasm32) %}
-    it "allocates buffer of correct size when UInt8 is given to new (#3332)" do
-      String.new(255_u8) do |buffer|
-        LibGC.size(buffer).should be >= 255
-        {255, 0}
-      end
-    end
-  {% end %}
-
-  it "raises on String.new if returned bytesize is greater than capacity" do
-    expect_raises ArgumentError, "Bytesize out of capacity bounds" do
-      String.new(123) do |buffer|
-        {124, 0}
-      end
-    end
-  end
-
   describe "invalid UTF-8 byte sequence" do
     it "gets size" do
       string = String.new(Bytes[255, 0, 0, 0, 65])
@@ -2848,7 +2887,67 @@ describe "String" do
 
     it "valid_encoding?" do
       "hello".valid_encoding?.should be_true
-      String.new(Bytes[255, 0]).valid_encoding?.should be_false
+      "hello\u{80}\u{7FF}\u{800}\u{FFFF}\u{10000}\u{10FFFF}".valid_encoding?.should be_true
+
+      # non-starters
+      String.new(Bytes[0x80]).valid_encoding?.should be_false
+      String.new(Bytes[0x8F]).valid_encoding?.should be_false
+      String.new(Bytes[0x90]).valid_encoding?.should be_false
+      String.new(Bytes[0x9F]).valid_encoding?.should be_false
+      String.new(Bytes[0xA0]).valid_encoding?.should be_false
+      String.new(Bytes[0xAF]).valid_encoding?.should be_false
+
+      # incomplete, 2-byte
+      String.new(Bytes[0xC2]).valid_encoding?.should be_false
+      String.new(Bytes[0xC2, 0x00]).valid_encoding?.should be_false
+      String.new(Bytes[0xC2, 0xC2]).valid_encoding?.should be_false
+
+      # overlong, 2-byte
+      String.new(Bytes[0xC0, 0x80]).valid_encoding?.should be_false
+      String.new(Bytes[0xC1, 0xBF]).valid_encoding?.should be_false
+      String.new(Bytes[0xC2, 0x80]).valid_encoding?.should be_true
+
+      # incomplete, 3-byte
+      String.new(Bytes[0xE1]).valid_encoding?.should be_false
+      String.new(Bytes[0xE1, 0x00]).valid_encoding?.should be_false
+      String.new(Bytes[0xE1, 0xC2]).valid_encoding?.should be_false
+      String.new(Bytes[0xE1, 0x80]).valid_encoding?.should be_false
+      String.new(Bytes[0xE1, 0x80, 0x00]).valid_encoding?.should be_false
+      String.new(Bytes[0xE1, 0x80, 0xC2]).valid_encoding?.should be_false
+
+      # overlong, 3-byte
+      String.new(Bytes[0xE0, 0x80, 0x80]).valid_encoding?.should be_false
+      String.new(Bytes[0xE0, 0x9F, 0xBF]).valid_encoding?.should be_false
+      String.new(Bytes[0xE0, 0xA0, 0x80]).valid_encoding?.should be_true
+
+      # surrogate pairs
+      String.new(Bytes[0xED, 0x9F, 0xBF]).valid_encoding?.should be_true
+      String.new(Bytes[0xED, 0xA0, 0x80]).valid_encoding?.should be_false
+      String.new(Bytes[0xED, 0xBF, 0xBF]).valid_encoding?.should be_false
+      String.new(Bytes[0xEE, 0x80, 0x80]).valid_encoding?.should be_true
+
+      # incomplete, 4-byte
+      String.new(Bytes[0xF1]).valid_encoding?.should be_false
+      String.new(Bytes[0xF1, 0x00]).valid_encoding?.should be_false
+      String.new(Bytes[0xF1, 0xC2]).valid_encoding?.should be_false
+      String.new(Bytes[0xF1, 0x80]).valid_encoding?.should be_false
+      String.new(Bytes[0xF1, 0x80, 0x00]).valid_encoding?.should be_false
+      String.new(Bytes[0xF1, 0x80, 0xC2]).valid_encoding?.should be_false
+      String.new(Bytes[0xF1, 0x80, 0x80]).valid_encoding?.should be_false
+      String.new(Bytes[0xF1, 0x80, 0x80, 0x00]).valid_encoding?.should be_false
+      String.new(Bytes[0xF1, 0x80, 0x80, 0xC2]).valid_encoding?.should be_false
+
+      # overlong, 4-byte
+      String.new(Bytes[0xF0, 0x80, 0x80, 0x80]).valid_encoding?.should be_false
+      String.new(Bytes[0xF0, 0x8F, 0xBF, 0xBF]).valid_encoding?.should be_false
+      String.new(Bytes[0xF0, 0x90, 0x80, 0x80]).valid_encoding?.should be_true
+
+      # upper boundary, 4-byte
+      String.new(Bytes[0xF4, 0x8F, 0xBF, 0xBF]).valid_encoding?.should be_true
+      String.new(Bytes[0xF4, 0x90, 0x80, 0x80]).valid_encoding?.should be_false
+      String.new(Bytes[0xF5]).valid_encoding?.should be_false
+      String.new(Bytes[0xF8]).valid_encoding?.should be_false
+      String.new(Bytes[0xFF]).valid_encoding?.should be_false
     end
 
     it "scrubs" do

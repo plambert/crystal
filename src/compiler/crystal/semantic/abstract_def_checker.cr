@@ -124,8 +124,8 @@ class Crystal::AbstractDefChecker
             implemented = true
           end
 
-          unless found_param_match
-            check_positional_param_names(target_type, ancestor_type, a_def, base, method)
+          unless found_param_match || target_type.abstract? || target_type.module?
+            check_positional_param_names(a_def, base, method)
             found_param_match = true if same_parameters?(a_def, method)
           end
         end
@@ -140,7 +140,7 @@ class Crystal::AbstractDefChecker
   def implements?(target_type : Type, t1 : Type, m1 : Def, free_vars1, t2 : Type, m2 : Def, free_vars2)
     return false if m1.abstract?
     return false unless m1.name == m2.name
-    return false unless m1.yields == m2.yields
+    return false unless m1.block_arity == m2.block_arity
 
     m1_args, m1_kargs = def_arg_ranges(m1)
     m2_args, m2_kargs = def_arg_ranges(m2)
@@ -368,14 +368,14 @@ class Crystal::AbstractDefChecker
     end
   end
 
-  def check_positional_param_names(target_type : Type, impl_type : Type, impl_method : Def, base_type : Type, base_method : Def)
+  def check_positional_param_names(impl_method : Def, base_type : Type, base_method : Def)
     impl_param_count = impl_method.splat_index || impl_method.args.size
     base_param_count = base_method.splat_index || base_method.args.size
     {impl_param_count, base_param_count}.min.times do |i|
       impl_param = impl_method.args[i]
       base_param = base_method.args[i]
       unless impl_param.external_name == base_param.external_name
-        @program.report_warning(impl_param, "positional parameter '#{impl_param.external_name}' corresponds to parameter '#{base_param.external_name}' of the overridden method #{Call.def_full_name(base_type, base_method)}, which has a different name and may affect named argument passing")
+        @program.warnings.add_warning(impl_param, "positional parameter '#{impl_param.external_name}' corresponds to parameter '#{base_param.external_name}' of the overridden method #{Call.def_full_name(base_type, base_method)}, which has a different name and may affect named argument passing")
       end
     end
   end

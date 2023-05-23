@@ -30,7 +30,7 @@ class Crystal::Repl::Compiler < Crystal::Visitor
   # This is different than `compiling_block`. Consider this code:
   #
   # ```
-  # def foo
+  # def foo(&)
   #   # When this is called from the top-level, `compiled_block`
   #   # will be the block given to `foo`, but `compiling_block`
   #   # will be `nil` because we are not compiling a block.
@@ -44,7 +44,7 @@ class Crystal::Repl::Compiler < Crystal::Visitor
   #   end
   # end
   #
-  # def bar
+  # def bar(&)
   #   yield
   # end
   #
@@ -137,13 +137,14 @@ class Crystal::Repl::Compiler < Crystal::Visitor
   def self.new(
     context : Context,
     compiled_def : CompiledDef,
-    top_level : Bool
+    top_level : Bool,
+    scope : Type = compiled_def.owner
   )
     new(
       context: context,
       local_vars: compiled_def.local_vars,
       instructions: compiled_def.instructions,
-      scope: compiled_def.owner,
+      scope: scope,
       def: compiled_def.def,
       top_level: top_level,
     )
@@ -343,11 +344,9 @@ class Crystal::Repl::Compiler < Crystal::Visitor
     in .u64?
       put_u64 value.to_u64, node: node
     in .i128?
-      # TODO: implement String#to_i128 and use it
-      put_i128 value.to_i64.to_i128!, node: node
+      put_i128 value.to_i128, node: node
     in .u128?
-      # TODO: implement String#to_i128 and use it
-      put_u128 value.to_u64.to_u128!, node: node
+      put_u128 value.to_u128, node: node
     in .f32?
       put_i32 value.to_f32.unsafe_as(Int32), node: node
     in .f64?
@@ -380,6 +379,14 @@ class Crystal::Repl::Compiler < Crystal::Visitor
   end
 
   def visit(node : TupleLiteral)
+    unless @wants_value
+      node.elements.each do |element|
+        discard_value element
+      end
+
+      return false
+    end
+
     type = node.type.as(TupleInstanceType)
 
     # A tuple potentially has the values packed (unaligned).
@@ -412,6 +419,14 @@ class Crystal::Repl::Compiler < Crystal::Visitor
   end
 
   def visit(node : NamedTupleLiteral)
+    unless @wants_value
+      node.entries.each do |entry|
+        discard_value entry.value
+      end
+
+      return false
+    end
+
     type = node.type.as(NamedTupleInstanceType)
 
     # This logic is similar to TupleLiteral.
@@ -964,7 +979,7 @@ class Crystal::Repl::Compiler < Crystal::Visitor
   end
 
   private def read_closured_var_pointer(closured_var : ClosuredVar, *, node : ASTNode?)
-    indexes, type = closured_var.indexes, closured_var.type
+    indexes = closured_var.indexes
 
     # First load the closure pointer
     closure_var_index = get_closure_var_index
@@ -1067,7 +1082,7 @@ class Crystal::Repl::Compiler < Crystal::Visitor
     false
   end
 
-  private def dispatch_class_var(node : ClassVar)
+  private def dispatch_class_var(node : ClassVar, &)
     var = node.var
     owner = var.owner
 
@@ -1085,7 +1100,7 @@ class Crystal::Repl::Compiler < Crystal::Visitor
     end
   end
 
-  private def dispatch_class_var(owner : Type, metaclass : Bool, node : ASTNode)
+  private def dispatch_class_var(owner : Type, metaclass : Bool, node : ASTNode, &)
     types = owner.all_subclasses.select { |t| t.is_a?(ClassVarContainer) }
     types.push(owner)
     types.sort_by! { |type| -type.depth }
@@ -1136,10 +1151,21 @@ class Crystal::Repl::Compiler < Crystal::Visitor
       def_name = "#{var.owner}::#{var.name}"
 
       fake_def = Def.new(def_name)
-      fake_def.owner = var.owner
+      fake_def.owner = var.owner.metaclass
       fake_def.vars = initializer.meta_vars
-      fake_def.body = value
-      fake_def.bind_to(value)
+
+      # Check if we need to upcast the value to the class var's type
+      fake_def.body =
+        if value.type? == var.type
+          value
+        else
+          cast = Cast.new(value, TypeNode.new(var.type))
+          cast.upcast = true
+          cast.type = var.type
+          cast
+        end
+
+      fake_def.bind_to(fake_def.body)
 
       compiled_def = CompiledDef.new(@context, fake_def, fake_def.owner, 0)
 
@@ -1147,7 +1173,7 @@ class Crystal::Repl::Compiler < Crystal::Visitor
       # program, but this needs to be fixed in the main compiler first
       declare_local_vars(fake_def, compiled_def.local_vars, @context.program)
 
-      compiler = Compiler.new(@context, compiled_def, top_level: true)
+      compiler = Compiler.new(@context, compiled_def, scope: fake_def.owner, top_level: true)
       compiler.compile_def(compiled_def, closure_owner: @context.program)
 
       {% if Debug::DECOMPILE %}
@@ -1524,6 +1550,8 @@ class Crystal::Repl::Compiler < Crystal::Visitor
   end
 
   def visit(node : Not)
+    node.type = @context.program.no_return unless node.type?
+
     exp = node.exp
     exp.accept self
     return false unless @wants_value
@@ -1594,7 +1622,7 @@ class Crystal::Repl::Compiler < Crystal::Visitor
                      begin
                        create_compiled_def(call, target_def)
                      rescue ex : Crystal::TypeException
-                       node.raise ex, inner: ex
+                       node.raise ex.message, inner: ex
                      end
       call compiled_def, node: node
 
@@ -1631,6 +1659,12 @@ class Crystal::Repl::Compiler < Crystal::Visitor
     end
 
     node.obj.accept self
+
+    if node.upcast?
+      upcast node.obj, obj_type, node.non_nilable_type
+      upcast node.obj, node.non_nilable_type, node.type
+      return
+    end
 
     # Check if obj is a `to_type`
     dup aligned_sizeof_type(node.obj), node: nil
@@ -1780,7 +1814,7 @@ class Crystal::Repl::Compiler < Crystal::Visitor
 
     body = target_def.body
     if body.is_a?(Primitive)
-      visit_primitive(node, body)
+      visit_primitive(node, body, target_def)
       return false
     end
 
@@ -1839,7 +1873,7 @@ class Crystal::Repl::Compiler < Crystal::Visitor
                    begin
                      create_compiled_def(node, target_def)
                    rescue ex : Crystal::TypeException
-                     node.raise ex, inner: ex
+                     node.raise ex.message, inner: ex
                    end
 
     if (block = node.block) && !block.fun_literal
@@ -1958,7 +1992,7 @@ class Crystal::Repl::Compiler < Crystal::Visitor
       pop aligned_sizeof_type(node), node: nil
     end
 
-    return false
+    false
   end
 
   private def create_compiled_def(node : Call, target_def : Def)
@@ -2244,7 +2278,7 @@ class Crystal::Repl::Compiler < Crystal::Visitor
       target_def_arg = target_def_args[i]
       target_def_var_type = target_def.vars.not_nil![target_def_arg.name].type
 
-      compile_call_arg(arg, arg_type, target_def_var_type)
+      compile_call_arg(arg, arg_type, target_def_arg.type, target_def_var_type)
 
       i += 1
     end
@@ -2291,7 +2325,7 @@ class Crystal::Repl::Compiler < Crystal::Visitor
     end
   end
 
-  private def compile_call_arg(arg, arg_type, target_def_var_type)
+  private def compile_call_arg(arg, arg_type, target_def_arg_type, target_def_var_type)
     # Check autocasting from symbol to enum
     if arg.is_a?(SymbolLiteral) && target_def_var_type.is_a?(EnumType)
       symbol_name = arg.value.underscore
@@ -2318,7 +2352,16 @@ class Crystal::Repl::Compiler < Crystal::Visitor
 
     request_value(arg)
 
-    # We need to cast the argument to the target_def variable
+    # Check number autocast but for non-literals
+    if arg_type != target_def_arg_type && arg_type.is_a?(IntegerType | FloatType) && target_def_arg_type.is_a?(IntegerType | FloatType)
+      primitive_convert(arg, arg_type, target_def_arg_type, checked: false)
+    else
+      # We first cast the argument to the def's arg type,
+      # which is the external methods' type.
+      downcast arg, arg_type, target_def_arg_type
+    end
+
+    # Then we need to cast the argument to the target_def variable
     # corresponding to the argument. If for example we have this:
     #
     # ```
@@ -2331,7 +2374,7 @@ class Crystal::Repl::Compiler < Crystal::Visitor
     #
     # Then the actual type of `x` inside `foo` is (Int32 | Nil),
     # and we must cast `1` to it.
-    upcast arg, arg_type, target_def_var_type
+    upcast arg, target_def_arg_type, target_def_var_type
   end
 
   private def compile_pointerof_node(obj : Var, owner : Type) : Nil
@@ -2431,9 +2474,6 @@ class Crystal::Repl::Compiler < Crystal::Visitor
       # We don't want pointer.value to return a copy of something
       # if we are calling through it
       call_obj = call_obj.not_nil!
-
-      element_type = call_obj.type.as(PointerInstanceType).element_type
-
       request_value(call_obj)
       return
     end
@@ -2644,8 +2684,7 @@ class Crystal::Repl::Compiler < Crystal::Visitor
       local_var = lookup_local_var_or_closured_var(exp.name)
       case local_var
       in LocalVar
-        index, type = local_var.index, local_var.type
-        pointerof_var(index, node: node)
+        pointerof_var(local_var.index, node: node)
       in ClosuredVar
         node.raise "BUG: missing interpreter out closured var"
       end
@@ -2711,8 +2750,6 @@ class Crystal::Repl::Compiler < Crystal::Visitor
       compiled_def.local_vars.declare(arg.name, var_type)
     end
 
-    a_def = @def
-
     needs_closure_context = (target_def.vars.try &.any? { |name, var| var.type? && var.closure_in?(target_def) })
 
     # Declare the closure context arg and var, if any
@@ -2743,7 +2780,7 @@ class Crystal::Repl::Compiler < Crystal::Visitor
       compiled_def.local_vars.declare(name, var_type)
     end
 
-    compiler = Compiler.new(@context, compiled_def, top_level: false)
+    compiler = Compiler.new(@context, compiled_def, scope: scope, top_level: false)
     begin
       compiler.compile_def(compiled_def, is_closure ? @closure_context : nil)
     rescue ex : Crystal::CodeError
@@ -3009,7 +3046,7 @@ class Crystal::Repl::Compiler < Crystal::Visitor
     false
   end
 
-  private def with_scope(scope : Type)
+  private def with_scope(scope : Type, &)
     old_scope = @scope
     @scope = scope
     begin
@@ -3372,7 +3409,7 @@ class Crystal::Repl::Compiler < Crystal::Visitor
   private macro nop
   end
 
-  private def with_node_override(node_override : ASTNode)
+  private def with_node_override(node_override : ASTNode, &)
     old_node_override = @node_override
     @node_override = node_override
     value = yield

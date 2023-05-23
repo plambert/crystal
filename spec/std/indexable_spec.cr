@@ -93,6 +93,28 @@ describe Indexable do
     end
   end
 
+  describe "#index!" do
+    it "offset type" do
+      indexable = SafeIndexable.new(3)
+      indexable.index!(1, 0_i64).should eq 1
+      indexable.index!(1, 0_i64).should be_a(Int64)
+    end
+
+    it "raises if no element is found" do
+      indexable = SafeIndexable.new(3)
+      expect_raises(Enumerable::NotFoundError) { indexable.index!(0, -100) }
+      expect_raises(Enumerable::NotFoundError) { indexable.index!(0, -4) }
+      expect_raises(Enumerable::NotFoundError) { indexable.index!(0, 1) }
+      expect_raises(Enumerable::NotFoundError) { indexable.index!(0, 3) }
+      expect_raises(Enumerable::NotFoundError) { indexable.index!(0, 100) }
+
+      expect_raises(Enumerable::NotFoundError) { indexable.index!(-4) { true } }
+      expect_raises(Enumerable::NotFoundError) { indexable.index!(3) { true } }
+      expect_raises(Enumerable::NotFoundError) { indexable.index!(2) { false } }
+      expect_raises(Enumerable::NotFoundError) { indexable.index!(-3) { false } }
+    end
+  end
+
   describe "#rindex" do
     it "does rindex with big negative offset" do
       indexable = SafeIndexable.new(3)
@@ -108,6 +130,28 @@ describe Indexable do
       indexable = SafeIndexable.new(3)
       indexable.rindex(1, 2_i64).should eq 1
       indexable.rindex(1, 2_i64).should be_a(Int64)
+    end
+  end
+
+  describe "#rindex!" do
+    it "does rindex with big negative offset" do
+      indexable = SafeIndexable.new(3)
+      expect_raises Enumerable::NotFoundError do
+        indexable.rindex!(0, -100)
+      end
+    end
+
+    it "does rindex with big offset" do
+      indexable = SafeIndexable.new(3)
+      expect_raises Enumerable::NotFoundError do
+        indexable.rindex!(0, 100)
+      end
+    end
+
+    it "offset type" do
+      indexable = SafeIndexable.new(3)
+      indexable.rindex!(1, 2_i64).should eq 1
+      indexable.rindex!(1, 2_i64).should be_a(Int64)
     end
   end
 

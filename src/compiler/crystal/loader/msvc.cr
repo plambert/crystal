@@ -20,11 +20,47 @@ class Crystal::Loader
 
   # Parses linker arguments in the style of `link.exe`.
   def self.parse(args : Array(String), *, search_paths : Array(String) = default_search_paths) : self
-    libnames = [] of String
+    search_paths, libnames = parse_args(args, search_paths)
     file_paths = [] of String
 
-    # NOTE: `/LIBPATH` overrides the default paths, not the other way round
+    begin
+      self.new(search_paths, libnames, file_paths)
+    rescue exc : LoadError
+      exc.args = args
+      exc.search_paths = search_paths
+      raise exc
+    end
+  end
+
+  # Returns the list of DLLs imported from the libraries specified in the given
+  # linker arguments. Used by the compiler for delay-loaded DLL support.
+  def self.search_dlls(args : Array(String), *, search_paths : Array(String) = default_search_paths) : Set(String)
+    search_paths, libnames = parse_args(args, search_paths)
+    dlls = Set(String).new
+
+    libnames.each do |libname|
+      search_paths.each do |directory|
+        library_path = File.join(directory, library_filename(libname))
+        next unless File.file?(library_path)
+
+        Crystal::System::LibraryArchive.imported_dlls(library_path).each do |dll|
+          dlls << dll unless dll.compare("kernel32.dll", case_insensitive: true).zero?
+        end
+        break
+      end
+    end
+
+    dlls
+  end
+
+  private def self.parse_args(args, search_paths)
+    libnames = [] of String
+
+    # NOTE: `/LIBPATH`s are prepended before the default paths:
     # (https://docs.microsoft.com/en-us/cpp/build/reference/libpath-additional-libpath)
+    #
+    # > ... The linker will first search in the path specified by this option,
+    # > and then search in the path specified in the LIB environment variable.
     extra_search_paths = [] of String
 
     args.each do |arg|
@@ -35,13 +71,8 @@ class Crystal::Loader
       end
     end
 
-    begin
-      self.new(extra_search_paths + search_paths, libnames, file_paths)
-    rescue exc : LoadError
-      exc.args = args
-      exc.search_paths = search_paths
-      raise exc
-    end
+    search_paths = extra_search_paths + search_paths
+    {search_paths, libnames}
   end
 
   def self.library_filename(libname : String) : String
@@ -60,6 +91,8 @@ class Crystal::Loader
   end
 
   def load_file?(path : String | ::Path) : Bool
+    return false unless File.file?(path)
+
     # On Windows, each `.lib` import library may reference any number of `.dll`
     # files, whose base names may not match the library's. Thus it is necessary
     # to extract this information from the library archive itself.
@@ -87,7 +120,7 @@ class Crystal::Loader
   end
 
   private def open_library(path : String)
-    LibC.LoadLibraryExW(path.check_no_null_byte.to_utf16, nil, 0)
+    LibC.LoadLibraryExW(System.to_wstr(path), nil, 0)
   end
 
   def load_current_program_handle

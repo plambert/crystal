@@ -5,6 +5,8 @@ require "random"
 # A `BigInt` can represent arbitrarily large integers.
 #
 # It is implemented under the hood with [GMP](https://gmplib.org/).
+#
+# NOTE: To use `BigInt`, you must explicitly import it with `require "big"`
 struct BigInt < Int
   include Comparable(Int::Signed)
   include Comparable(Int::Unsigned)
@@ -45,25 +47,49 @@ struct BigInt < Int
   end
 
   # Creates a `BigInt` from the given *num*.
-  def initialize(num : Int::Signed)
-    if LibC::Long::MIN <= num <= LibC::Long::MAX
-      LibGMP.init_set_si(out @mpz, num)
+  def self.new(num : Int::Primitive)
+    if LibGMP::SI::MIN <= num <= LibGMP::UI::MAX
+      if num <= LibGMP::SI::MAX
+        LibGMP.init_set_si(out mpz1, LibGMP::SI.new!(num))
+        new(mpz1)
+      else
+        LibGMP.init_set_ui(out mpz2, LibGMP::UI.new!(num))
+        new(mpz2)
+      end
     else
-      LibGMP.init_set_str(out @mpz, num.to_s, 10)
+      negative = num < 0
+      num = num.abs_unsigned
+      capacity = (num.bit_length - 1) // (sizeof(LibGMP::MpLimb) * 8) + 1
+
+      unsafe_build(capacity) do |limbs|
+        appender = limbs.to_unsafe.appender
+        limbs.size.times do
+          appender << LibGMP::MpLimb.new!(num)
+          num = num.unsafe_shr(sizeof(LibGMP::MpLimb) * 8)
+        end
+        {capacity, negative}
+      end
     end
   end
 
-  # :ditto:
-  def initialize(num : Int::Unsigned)
-    if num <= LibC::ULong::MAX
-      LibGMP.init_set_ui(out @mpz, num)
-    else
-      LibGMP.init_set_str(out @mpz, num.to_s, 10)
-    end
+  private def self.unsafe_build(capacity : Int, & : Slice(LibGMP::MpLimb) -> {Int, Bool})
+    # https://gmplib.org/manual/Initializing-Integers:
+    #
+    # > In preparation for an operation, GMP often allocates one limb more than
+    # > ultimately needed. To make sure GMP will not perform reallocation for x,
+    # > you need to add the number of bits in mp_limb_t to n.
+    LibGMP.init2(out mpz, (capacity + 1) * sizeof(LibGMP::MpLimb) * 8)
+    limbs = LibGMP.limbs_write(pointerof(mpz), capacity)
+    size, negative = yield Slice.new(limbs, capacity)
+    LibGMP.limbs_finish(pointerof(mpz), size * (negative ? -1 : 1))
+    new(mpz)
   end
 
   # :ditto:
+  #
+  # *num* must be finite.
   def initialize(num : Float::Primitive)
+    raise ArgumentError.new "Can only construct from a finite number" unless num.finite?
     LibGMP.init_set_d(out @mpz, num)
   end
 
@@ -93,7 +119,7 @@ struct BigInt < Int
   end
 
   # :nodoc:
-  def self.new
+  def self.new(&)
     LibGMP.init(out mpz)
     yield pointerof(mpz)
     new(mpz)
@@ -119,8 +145,8 @@ struct BigInt < Int
     end
   end
 
-  def <=>(other : Float)
-    LibGMP.cmp_d(mpz, other)
+  def <=>(other : Float::Primitive)
+    LibGMP.cmp_d(mpz, other) unless other.nan?
   end
 
   def +(other : BigInt) : BigInt
@@ -253,7 +279,7 @@ struct BigInt < Int
     check_division_by_zero other
 
     if other < 0
-      -(-self).unsafe_floored_mod(-other)
+      -(-self).unsafe_floored_mod(other.abs)
     else
       unsafe_floored_mod(other)
     end
@@ -342,6 +368,35 @@ struct BigInt < Int
     the_q = BigInt.new
     the_r = BigInt.new { |r| LibGMP.tdiv_qr_ui(the_q, r, self, number) }
     {the_q, the_r}
+  end
+
+  def divisible_by?(number : BigInt) : Bool
+    LibGMP.divisible_p(self, number) != 0
+  end
+
+  def divisible_by?(number : LibGMP::ULong) : Bool
+    LibGMP.divisible_ui_p(self, number) != 0
+  end
+
+  def divisible_by?(number : Int) : Bool
+    if 0 <= number <= LibGMP::ULong::MAX
+      LibGMP.divisible_ui_p(self, number) != 0
+    elsif LibGMP::Long::MIN < number < 0
+      LibGMP.divisible_ui_p(self, number.abs) != 0
+    else
+      divisible_by?(number.to_big_i)
+    end
+  end
+
+  # :nodoc:
+  # returns `{reduced, count}` such that `self % (number ** count) == 0`,
+  # `self % (number ** (count + 1)) != 0`, and `reduced == self / (number ** count)`
+  def factor_by(number : Int) : {BigInt, UInt64}
+    return {self, 0_u64} unless divisible_by?(number)
+
+    reduced = BigInt.new
+    count = LibGMP.remove(reduced, self, number.to_big_i)
+    {reduced, count.to_u64}
   end
 
   def ~ : BigInt
@@ -552,6 +607,14 @@ struct BigInt < Int
 
   def trailing_zeros_count : Int
     LibGMP.scan1(self, 0)
+  end
+
+  # :nodoc:
+  def next_power_of_two : self
+    one = BigInt.new(1)
+    return one if self <= 0
+
+    popcount == 1 ? self : one << bit_length
   end
 
   def to_i : Int32
@@ -772,7 +835,8 @@ struct Float
   include Comparable(BigInt)
 
   def <=>(other : BigInt)
-    -(other <=> self)
+    cmp = other <=> self
+    -cmp if cmp
   end
 
   # Returns a `BigInt` representing this float (rounded using `floor`).
@@ -815,6 +879,20 @@ module Math
   # Calculates the integer square root of *value*.
   def isqrt(value : BigInt)
     BigInt.new { |mpz| LibGMP.sqrt(mpz, value) }
+  end
+
+  # Computes the smallest nonnegative power of 2 that is greater than or equal
+  # to *v*.
+  #
+  # The returned value has the same type as the argument.
+  #
+  # ```
+  # Math.pw2ceil(33) # => 64
+  # Math.pw2ceil(64) # => 64
+  # Math.pw2ceil(-5) # => 1
+  # ```
+  def pw2ceil(v : BigInt) : BigInt
+    v.next_power_of_two
   end
 end
 

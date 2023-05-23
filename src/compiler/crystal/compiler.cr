@@ -3,6 +3,7 @@ require "file_utils"
 require "colorize"
 require "crystal/digest/md5"
 {% if flag?(:msvc) %}
+  require "./loader"
   require "crystal/system/win32/visual_studio"
   require "crystal/system/win32/windows_sdk"
 {% end %}
@@ -15,18 +16,13 @@ module Crystal
     Default     = LineNumbers
   end
 
-  enum Warnings
-    All
-    None
-  end
-
   # Main interface to the compiler.
   #
   # A Compiler parses source code, type checks it and
   # optionally generates an executable.
   class Compiler
-    CC = ENV["CC"]? || "cc"
-    CL = "cl.exe"
+    private DEFAULT_LINKER = ENV["CC"]? || "cc"
+    private MSVC_LINKER    = ENV["CC"]? || "cl.exe"
 
     # A source to the compiler: its filename and source code.
     record Source,
@@ -109,14 +105,8 @@ module Crystal
     # and can later be used to generate API docs.
     property? wants_doc = false
 
-    # Which kind of warnings wants to be detected.
-    property warnings : Warnings = Warnings::All
-
-    # Paths to ignore for warnings detection.
-    property warnings_exclude : Array(String) = [] of String
-
-    # If `true` compiler will error if warnings are found.
-    property error_on_warnings : Bool = false
+    # Warning settings and all detected warnings.
+    property warnings = WarningCollection.new
 
     @[Flags]
     enum EmitTarget
@@ -205,7 +195,6 @@ module Crystal
       @program = program = Program.new
       program.compiler = self
       program.filename = sources.first.filename
-      program.cache_dir = CacheDir.instance.directory_for(sources)
       program.codegen_target = codegen_target
       program.target_machine = target_machine
       program.flags << "release" if release?
@@ -218,8 +207,6 @@ module Crystal
       program.show_error_trace = show_error_trace?
       program.progress_tracker = @progress_tracker
       program.warnings = @warnings
-      program.warnings_exclude = @warnings_exclude.map { |p| File.expand_path p }
-      program.error_on_warnings = @error_on_warnings
       program
     end
 
@@ -243,7 +230,7 @@ module Crystal
     end
 
     private def parse(program, source : Source)
-      parser = Parser.new(source.code, program.string_pool)
+      parser = program.new_parser(source.code)
       parser.filename = source.filename
       parser.wants_doc = wants_doc?
       parser.parse
@@ -299,17 +286,12 @@ module Crystal
       result
     end
 
-    private def with_file_lock(output_dir)
-      {% if flag?(:win32) %}
-        # TODO: use flock when it's supported in Windows
-        yield
-      {% else %}
-        File.open(File.join(output_dir, "compiler.lock"), "w") do |file|
-          file.flock_exclusive do
-            yield
-          end
+    private def with_file_lock(output_dir, &)
+      File.open(File.join(output_dir, "compiler.lock"), "w") do |file|
+        file.flock_exclusive do
+          yield
         end
-      {% end %}
+      end
     end
 
     private def run_dsymutil(filename)
@@ -326,13 +308,16 @@ module Crystal
       llvm_mod = unit.llvm_mod
       object_name = output_filename + program.object_extension
 
-      optimize llvm_mod if @release
+      @progress_tracker.stage("Codegen (bc+obj)") do
+        optimize llvm_mod if @release
 
-      unit.emit(@emit_targets, emit_base_filename || output_filename)
+        unit.emit(@emit_targets, emit_base_filename || output_filename)
 
-      target_machine.emit_obj_to_file llvm_mod, object_name
+        target_machine.emit_obj_to_file llvm_mod, object_name
+      end
 
-      print_command(*linker_command(program, [object_name], output_filename, nil))
+      _, command, args = linker_command(program, [object_name], output_filename, nil)
+      print_command(command, args)
     end
 
     private def print_command(command, args)
@@ -348,7 +333,7 @@ module Crystal
         object_arg = Process.quote_windows(object_names)
         output_arg = Process.quote_windows("/Fe#{output_filename}")
 
-        cl = CL
+        linker = MSVC_LINKER
         link_args = [] of String
 
         # if the compiler and the target both have the `msvc` flag, we are not
@@ -357,8 +342,8 @@ module Crystal
         {% if flag?(:msvc) %}
           if msvc_path = Crystal::System::VisualStudio.find_latest_msvc_path
             if win_sdk_libpath = Crystal::System::WindowsSDK.find_win10_sdk_libpath
-              host_bits = {{ flag?(:bits64) ? "x64" : "x86" }}
-              target_bits = program.has_flag?("bits64") ? "x64" : "x86"
+              host_bits = {{ flag?(:aarch64) ? "ARM64" : flag?(:bits64) ? "x64" : "x86" }}
+              target_bits = program.has_flag?("aarch64") ? "arm64" : program.has_flag?("bits64") ? "x64" : "x86"
 
               # MSVC build tools and Windows SDK found; recreate `LIB` environment variable
               # that is normally expected on the MSVC developer command prompt
@@ -368,7 +353,9 @@ module Crystal
               link_args << Process.quote_windows("/LIBPATH:#{win_sdk_libpath.join("um", target_bits)}")
 
               # use exact path for compiler instead of relying on `PATH`
-              cl = Process.quote_windows(msvc_path.join("bin", "Host#{host_bits}", target_bits, "cl.exe").to_s)
+              # (letter case shouldn't matter in most cases but being exact doesn't hurt here)
+              target_bits = target_bits.sub("arm", "ARM")
+              linker = Process.quote_windows(msvc_path.join("bin", "Host#{host_bits}", target_bits, "cl.exe").to_s) unless ENV.has_key?("CC")
             end
           end
         {% end %}
@@ -378,8 +365,21 @@ module Crystal
         link_args << lib_flags
         @link_flags.try { |flags| link_args << flags }
 
+        {% if flag?(:msvc) %}
+          if program.has_flag?("preview_dll") && !program.has_flag?("no_win32_delay_load")
+            # "LINK : warning LNK4199: /DELAYLOAD:foo.dll ignored; no imports found from foo.dll"
+            # it is harmless to skip this error because not all import libraries are always used, much
+            # less the individual DLLs they refer to
+            link_args << "/IGNORE:4199"
+
+            Loader.search_dlls(Process.parse_arguments_windows(link_args.join(' '))).each do |dll|
+              link_args << "/DELAYLOAD:#{dll}"
+            end
+          end
+        {% end %}
+
         args = %(/nologo #{object_arg} #{output_arg} /link #{link_args.join(' ')}).gsub("\n", " ")
-        cmd = "#{cl} #{args}"
+        cmd = "#{linker} #{args}"
 
         if cmd.to_utf16.size > 32000
           # The command line would be too big, pass the args through a UTF-16-encoded file instead.
@@ -390,18 +390,18 @@ module Crystal
 
           args_filename = "#{output_dir}/linker_args.txt"
           File.write(args_filename, args_bytes)
-          cmd = "#{cl} #{Process.quote_windows("@" + args_filename)}"
+          cmd = "#{linker} #{Process.quote_windows("@" + args_filename)}"
         end
 
-        {cmd, nil}
+        {linker, cmd, nil}
       elsif program.has_flag? "wasm32"
         link_flags = @link_flags || ""
-        { %(wasm-ld "${@}" -o #{Process.quote_posix(output_filename)} #{link_flags} -lc #{program.lib_flags}), object_names }
+        {"wasm-ld", %(wasm-ld "${@}" -o #{Process.quote_posix(output_filename)} #{link_flags} -lc #{program.lib_flags}), object_names}
       else
         link_flags = @link_flags || ""
         link_flags += " -rdynamic"
 
-        { %(#{CC} "${@}" -o #{Process.quote_posix(output_filename)} #{link_flags} #{program.lib_flags}), object_names }
+        {DEFAULT_LINKER, %(#{DEFAULT_LINKER} "${@}" -o #{Process.quote_posix(output_filename)} #{link_flags} #{program.lib_flags}), object_names}
       end
     end
 
@@ -433,21 +433,7 @@ module Crystal
 
       @progress_tracker.stage("Codegen (linking)") do
         Dir.cd(output_dir) do
-          linker_command = linker_command(program, object_names, output_filename, output_dir, expand: true)
-
-          process_wrapper(*linker_command) do |command, args|
-            Process.run(command, args, shell: true,
-              input: Process::Redirect::Close, output: Process::Redirect::Inherit, error: Process::Redirect::Pipe) do |process|
-              process.error.each_line(chomp: false) do |line|
-                hint_string = colorize("(this usually means you need to install the development package for lib\\1)").yellow.bold
-                line = line.gsub(/cannot find -l(\S+)\b/, "cannot find -l\\1 #{hint_string}")
-                line = line.gsub(/unable to find library -l(\S+)\b/, "unable to find library -l\\1 #{hint_string}")
-                line = line.gsub(/library not found for -l(\S+)\b/, "library not found for -l\\1 #{hint_string}")
-                STDERR << line
-              end
-            end
-            $?
-          end
+          run_linker *linker_command(program, object_names, output_filename, output_dir, expand: true)
         end
       end
 
@@ -470,7 +456,9 @@ module Crystal
         return all_reused
       end
 
-      {% if flag?(:preview_mt) %}
+      {% if !Crystal::System::Process.class.has_method?("fork") %}
+        raise "Cannot fork compiler. `Crystal::System::Process.fork` is not implemented on this system."
+      {% elsif flag?(:preview_mt) %}
         raise "Cannot fork compiler in multithread mode"
       {% else %}
         jobs_count = 0
@@ -494,7 +482,7 @@ module Crystal
               end
             end
 
-            codegen_process = Process.fork do
+            codegen_process = Crystal::System::Process.fork do
               pipe_w = pw
               slice.each do |unit|
                 unit.compile
@@ -504,7 +492,7 @@ module Crystal
                 end
               end
             end
-            codegen_process.wait
+            Process.new(codegen_process).wait
 
             if pipe_w = pw
               pipe_w.close
@@ -621,15 +609,46 @@ module Crystal
       end
     end
 
-    private def process_wrapper(command, args = nil)
+    private def run_linker(linker_name, command, args)
       print_command(command, args) if verbose?
 
-      status = yield command, args
+      begin
+        Process.run(command, args, shell: true,
+          input: Process::Redirect::Close, output: Process::Redirect::Inherit, error: Process::Redirect::Pipe) do |process|
+          process.error.each_line(chomp: false) do |line|
+            hint_string = colorize("(this usually means you need to install the development package for lib\\1)").yellow.bold
+            line = line.gsub(/cannot find -l(\S+)\b/, "cannot find -l\\1 #{hint_string}")
+            line = line.gsub(/unable to find library -l(\S+)\b/, "unable to find library -l\\1 #{hint_string}")
+            line = line.gsub(/library not found for -l(\S+)\b/, "library not found for -l\\1 #{hint_string}")
+            STDERR << line
+          end
+        end
+      rescue exc : File::AccessDeniedError | File::NotFoundError
+        linker_not_found exc.class, linker_name
+      end
 
+      status = $?
       unless status.success?
-        msg = status.normal_exit? ? "code: #{status.exit_code}" : "signal: #{status.exit_signal} (#{status.exit_signal.value})"
+        if status.normal_exit?
+          case status.exit_code
+          when 126
+            linker_not_found File::AccessDeniedError, linker_name
+          when 127
+            linker_not_found File::NotFoundError, linker_name
+          end
+        end
         code = status.normal_exit? ? status.exit_code : 1
-        error "execution of command failed with #{msg}: `#{command}`", exit_code: code
+        error "execution of command failed with exit status #{status}: #{command}", exit_code: code
+      end
+    end
+
+    private def linker_not_found(exc_class, linker_name)
+      verbose_info = "\nRun with `--verbose` to print the full linker command." unless verbose?
+      case exc_class
+      when File::AccessDeniedError
+        error "Could not execute linker: `#{linker_name}`: Permission denied#{verbose_info}"
+      else
+        error "Could not execute linker: `#{linker_name}`: File not found#{verbose_info}"
       end
     end
 

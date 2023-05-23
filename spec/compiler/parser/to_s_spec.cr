@@ -142,11 +142,13 @@ describe "ASTNode#to_s" do
   expect_to_s "foo[x, y, a: 1, b: 2] = z"
   expect_to_s %(@[Foo(1, 2, a: 1, b: 2)])
   expect_to_s %(lib Foo\nend)
+  expect_to_s %(lib LibC\n  fun getchar(Int, Float)\nend)
   expect_to_s %(fun foo(a : Void, b : Void, ...) : Void\n\nend)
   expect_to_s %(lib Foo\n  struct Foo\n    a : Void\n    b : Void\n  end\nend)
   expect_to_s %(lib Foo\n  union Foo\n    a : Int\n    b : Int32\n  end\nend)
   expect_to_s %(lib Foo\n  FOO = 0\nend)
   expect_to_s %(lib LibC\n  fun getch = "get.char"\nend)
+  expect_to_s %(lib Foo::Bar\nend)
   expect_to_s %(enum Foo\n  A = 0\n  B\nend)
   expect_to_s %(alias Foo = Void)
   expect_to_s %(alias Foo::Bar = Void)
@@ -168,6 +170,8 @@ describe "ASTNode#to_s" do
   expect_to_s %(if (1 + 2\n3)\n  4\nend)
   expect_to_s "%x(whoami)", "`whoami`"
   expect_to_s %(begin\n  ()\nend)
+  expect_to_s %(if 1\n  begin\n    2\n  end\nelse\n  begin\n    3\n  end\nend)
+  expect_to_s %(foo do\n  begin\n    bar\n  end\nend)
   expect_to_s %q("\e\0\""), %q("\e\u0000\"")
   expect_to_s %q("#{1}\0"), %q("#{1}\u0000")
   expect_to_s %q(%r{\/\0}), %q(/\/\0/)
@@ -215,4 +219,8 @@ describe "ASTNode#to_s" do
   expect_to_s "->::foo(Int32, String)"
   expect_to_s "->::Foo::Bar.foo"
   expect_to_s "yield(1)"
+  expect_to_s "def foo\n  yield\nend", "def foo(&)\n  yield\nend"
+  expect_to_s "def foo(x)\n  yield\nend", "def foo(x, &)\n  yield\nend"
+  expect_to_s "def foo(**x)\n  yield\nend", "def foo(**x, &)\n  yield\nend"
+  expect_to_s "macro foo(x)\n  yield\nend"
 end

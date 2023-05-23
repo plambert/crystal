@@ -6,7 +6,6 @@ class Crystal::Repl
   def initialize
     @program = Program.new
     @context = Context.new(@program)
-    @line_number = 1
     @main_visitor = MainVisitor.new(@program)
 
     @interpreter = Interpreter.new(@context)
@@ -15,52 +14,33 @@ class Crystal::Repl
   def run
     load_prelude
 
-    prompt = Prompt.new(@context, show_nest: true)
+    reader = ReplReader.new(repl: self)
+    reader.color = @context.program.color?
 
-    while true
-      input = prompt.prompt("icr:#{prompt.line_number}")
-      unless input
-        # Explicitly call exit on ctrl+D so at_exit handlers run
-        interpret_exit
+    reader.read_loop do |expression|
+      case expression
+      when "exit"
         break
-      end
+      when .presence
+        parser = new_parser(expression)
+        parser.warnings.report(STDOUT)
 
-      if input.blank?
-        prompt.line_number += 1
-        next
-      end
+        node = parser.parse
+        next unless node
 
-      node = prompt.parse(
-        input: input,
-        var_scopes: [@interpreter.local_vars.names_at_block_level_zero.to_set],
-      )
-      next unless node
-
-      begin
         value = interpret(node)
-        prompt.display(value)
-      rescue ex : EscapingException
-        @nest = 0
-        @buffer = ""
-        @line_number += 1
-
-        print "Unhandled exception: "
-        print ex
-      rescue ex : Crystal::CodeError
-        @nest = 0
-        @buffer = ""
-        @line_number += 1
-
-        ex.color = true
-        ex.error_trace = true
-        puts ex
-      rescue ex : Exception
-        @nest = 0
-        @buffer = ""
-        @line_number += 1
-
-        ex.inspect_with_backtrace(STDOUT)
+        print " => "
+        puts SyntaxHighlighter::Colorize.highlight!(value.to_s)
       end
+    rescue ex : EscapingException
+      print "Unhandled exception: "
+      print ex
+    rescue ex : Crystal::CodeError
+      ex.color = @context.program.color?
+      ex.error_trace = true
+      puts ex
+    rescue ex : Exception
+      ex.inspect_with_backtrace(STDOUT)
     end
   end
 
@@ -95,6 +75,8 @@ class Crystal::Repl
   end
 
   private def interpret(node : ASTNode)
+    @main_visitor = MainVisitor.new(from_main_visitor: @main_visitor)
+
     node = @program.normalize(node)
     node = @program.semantic(node, main_visitor: @main_visitor)
     @interpreter.interpret(node, @main_visitor.meta_vars)
@@ -127,9 +109,12 @@ class Crystal::Repl
   end
 
   private def parse_code(code, filename = "")
-    parser = Parser.new code, @program.string_pool
+    warnings = @program.warnings.dup
+    warnings.infos = [] of String
+    parser = Parser.new code, @program.string_pool, warnings: warnings
     parser.filename = filename
     parsed_nodes = parser.parse
+    warnings.report(STDOUT)
     @program.normalize(parsed_nodes, inside_exp: false)
   end
 
@@ -139,7 +124,7 @@ class Crystal::Repl
 
   private def interpret_crystal_exit(exception : EscapingException)
     decl = UninitializedVar.new(Var.new("ex"), TypeNode.new(@context.program.exception.virtual_type))
-    call = Call.new(Path.global("Crystal"), "exit", [NumberLiteral.new(1), Var.new("ex")] of ASTNode)
+    call = Call.new(Path.global("Crystal"), "exit", NumberLiteral.new(1), Var.new("ex"))
     exps = Expressions.new([decl, call] of ASTNode)
 
     begin
@@ -149,5 +134,13 @@ class Crystal::Repl
     rescue ex
       puts "Error while calling Crystal.exit: #{ex.message}"
     end
+  end
+
+  protected def new_parser(source)
+    Parser.new(
+      source,
+      string_pool: @context.program.string_pool,
+      var_scopes: [@interpreter.local_vars.names_at_block_level_zero.to_set]
+    )
   end
 end
