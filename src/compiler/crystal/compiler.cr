@@ -39,7 +39,7 @@ module Crystal
     # If `true`, doesn't generate an executable but instead
     # creates a `.o` file and outputs a command line to link
     # it in the target machine.
-    property cross_compile = false
+    property? cross_compile = false
 
     # Compiler flags. These will be true when checked in macro
     # code by the `flag?(...)` macro method.
@@ -150,12 +150,21 @@ module Crystal
     # Compiles the given *source*, with *output_filename* as the name
     # of the generated executable.
     #
+    # If *combine_rpath* is true, add the compiler itself's RPATH to the
+    # generated executable via `CrystalLibraryPath.add_compiler_rpath`. This is
+    # used by the `run` / `eval` / `spec` commands as well as the macro `run`
+    # (via `Crystal::Program#macro_compile`), and never during cross-compiling.
+    #
     # Raises `Crystal::CodeError` if there's an error in the
     # source code.
     #
     # Raises `InvalidByteSequenceError` if the source code is not
     # valid UTF-8.
-    def compile(source : Source | Array(Source), output_filename : String) : Result
+    def compile(source : Source | Array(Source), output_filename : String, *, combine_rpath : Bool = false) : Result
+      if combine_rpath
+        return CrystalLibraryPath.add_compiler_rpath { compile(source, output_filename, combine_rpath: false) }
+      end
+
       source = [source] unless source.is_a?(Array)
       program = new_program(source)
       node = parse program, source
@@ -306,17 +315,16 @@ module Crystal
     private def cross_compile(program, units, output_filename)
       unit = units.first
       llvm_mod = unit.llvm_mod
-      object_name = output_filename + program.object_extension
 
       @progress_tracker.stage("Codegen (bc+obj)") do
         optimize llvm_mod if @release
 
         unit.emit(@emit_targets, emit_base_filename || output_filename)
 
-        target_machine.emit_obj_to_file llvm_mod, object_name
+        target_machine.emit_obj_to_file llvm_mod, output_filename
       end
 
-      _, command, args = linker_command(program, [object_name], output_filename, nil)
+      _, command, args = linker_command(program, [output_filename], output_filename, nil)
       print_command(command, args)
     end
 
@@ -366,14 +374,29 @@ module Crystal
         @link_flags.try { |flags| link_args << flags }
 
         {% if flag?(:msvc) %}
-          if program.has_flag?("preview_dll") && !program.has_flag?("no_win32_delay_load")
-            # "LINK : warning LNK4199: /DELAYLOAD:foo.dll ignored; no imports found from foo.dll"
-            # it is harmless to skip this error because not all import libraries are always used, much
-            # less the individual DLLs they refer to
-            link_args << "/IGNORE:4199"
+          unless @cross_compile
+            extra_suffix = program.has_flag?("preview_dll") ? "-dynamic" : "-static"
+            search_result = Loader.search_libraries(Process.parse_arguments_windows(link_args.join(' ').gsub('\n', ' ')), extra_suffix: extra_suffix)
+            if not_found = search_result.not_found?
+              error "Cannot locate the .lib files for the following libraries: #{not_found.join(", ")}"
+            end
 
-            Loader.search_dlls(Process.parse_arguments_windows(link_args.join(' '))).each do |dll|
-              link_args << "/DELAYLOAD:#{dll}"
+            link_args = search_result.remaining_args.concat(search_result.library_paths).map { |arg| Process.quote_windows(arg) }
+
+            if !program.has_flag?("no_win32_delay_load")
+              # "LINK : warning LNK4199: /DELAYLOAD:foo.dll ignored; no imports found from foo.dll"
+              # it is harmless to skip this error because not all import libraries are always used, much
+              # less the individual DLLs they refer to
+              link_args << "/IGNORE:4199"
+
+              dlls = Set(String).new
+              search_result.library_paths.each do |library_path|
+                Crystal::System::LibraryArchive.imported_dlls(library_path).each do |dll|
+                  dlls << dll.downcase
+                end
+              end
+              dlls.delete "kernel32.dll"
+              dlls.each { |dll| link_args << "/DELAYLOAD:#{dll}" }
             end
           end
         {% end %}
@@ -563,51 +586,45 @@ module Crystal
       exit 1
     end
 
-    protected def optimize(llvm_mod)
-      {% if LibLLVM::IS_LT_130 %}
-        optimize_with_old_pass_manager(llvm_mod)
-      {% else %}
-        optimize_with_new_pass_manager(llvm_mod)
-      {% end %}
-    end
-
-    private def optimize_with_old_pass_manager(llvm_mod)
-      fun_pass_manager = llvm_mod.new_function_pass_manager
-      pass_manager_builder.populate fun_pass_manager
-      fun_pass_manager.run llvm_mod
-      module_pass_manager.run llvm_mod
-    end
-
-    private def optimize_with_new_pass_manager(llvm_mod)
-      LLVM::PassBuilderOptions.new do |options|
-        LLVM.run_passes(llvm_mod, "default<O3>", target_machine, options)
+    {% if LibLLVM::IS_LT_130 %}
+      protected def optimize(llvm_mod)
+        fun_pass_manager = llvm_mod.new_function_pass_manager
+        pass_manager_builder.populate fun_pass_manager
+        fun_pass_manager.run llvm_mod
+        module_pass_manager.run llvm_mod
       end
-    end
 
-    @module_pass_manager : LLVM::ModulePassManager?
+      @module_pass_manager : LLVM::ModulePassManager?
 
-    private def module_pass_manager
-      @module_pass_manager ||= begin
-        mod_pass_manager = LLVM::ModulePassManager.new
-        pass_manager_builder.populate mod_pass_manager
-        mod_pass_manager
+      private def module_pass_manager
+        @module_pass_manager ||= begin
+          mod_pass_manager = LLVM::ModulePassManager.new
+          pass_manager_builder.populate mod_pass_manager
+          mod_pass_manager
+        end
       end
-    end
 
-    @pass_manager_builder : LLVM::PassManagerBuilder?
+      @pass_manager_builder : LLVM::PassManagerBuilder?
 
-    private def pass_manager_builder
-      @pass_manager_builder ||= begin
-        registry = LLVM::PassRegistry.instance
-        registry.initialize_all
+      private def pass_manager_builder
+        @pass_manager_builder ||= begin
+          registry = LLVM::PassRegistry.instance
+          registry.initialize_all
 
-        builder = LLVM::PassManagerBuilder.new
-        builder.opt_level = 3
-        builder.size_level = 0
-        builder.use_inliner_with_threshold = 275
-        builder
+          builder = LLVM::PassManagerBuilder.new
+          builder.opt_level = 3
+          builder.size_level = 0
+          builder.use_inliner_with_threshold = 275
+          builder
+        end
       end
-    end
+    {% else %}
+      protected def optimize(llvm_mod)
+        LLVM::PassBuilderOptions.new do |options|
+          LLVM.run_passes(llvm_mod, "default<O3>", target_machine, options)
+        end
+      end
+    {% end %}
 
     private def run_linker(linker_name, command, args)
       print_command(command, args) if verbose?
@@ -693,7 +710,7 @@ module Crystal
           @name = "#{@name[0..16]}-#{::Crystal::Digest::MD5.hexdigest(@name)}"
         end
 
-        @object_extension = program.object_extension
+        @object_extension = compiler.codegen_target.object_extension
       end
 
       def compile

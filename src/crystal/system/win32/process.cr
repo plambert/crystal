@@ -149,6 +149,13 @@ struct Crystal::System::Process
     end
   end
 
+  def self.setup_default_interrupt_handlers
+    on_interrupt do
+      # Exit code 3 indicates `std::abort` was called which corresponds to the interrupt handler
+      ::exit 3
+    end
+  end
+
   def self.exists?(pid)
     handle = LibC.OpenProcess(LibC::PROCESS_QUERY_INFORMATION, 0, pid)
     return false unless handle
@@ -212,7 +219,7 @@ struct Crystal::System::Process
        ) == 0
       error = WinError.value
       case error.to_errno
-      when Errno::EACCES, Errno::ENOENT
+      when Errno::EACCES, Errno::ENOENT, Errno::ENOEXEC
         raise ::File::Error.from_os_error("Error executing process", error, file: command_args)
       else
         raise IO::Error.from_os_error("Error executing process: '#{command_args}'", error)
