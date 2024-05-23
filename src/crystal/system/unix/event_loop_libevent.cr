@@ -18,15 +18,18 @@ class Crystal::LibEvent::EventLoop < Crystal::EventLoop
     end
   {% end %}
 
-  # Runs the event loop.
-  def run_once : Nil
-    event_base.run_once
+  def run(blocking : Bool) : Bool
+    event_base.loop(once: true, nonblock: !blocking)
+  end
+
+  def interrupt : Nil
+    event_base.loop_exit
   end
 
   # Create a new resume event for a fiber.
   def create_resume_event(fiber : Fiber) : Crystal::EventLoop::Event
     event_base.new_event(-1, LibEvent2::EventFlags::None, fiber) do |s, flags, data|
-      Crystal::Scheduler.enqueue data.as(Fiber)
+      data.as(Fiber).enqueue
     end
   end
 
@@ -38,7 +41,7 @@ class Crystal::LibEvent::EventLoop < Crystal::EventLoop
         f.timeout_select_action = nil
         select_action.time_expired(f)
       else
-        Crystal::Scheduler.enqueue f
+        f.enqueue
       end
     end
   end
