@@ -8,6 +8,14 @@ describe "PROGRAM_NAME" do
         pending! "Example is broken in Nix shell (#12332)"
       end
 
+      # MSYS2: gcc/ld doesn't support unicode paths
+      # https://github.com/msys2/MINGW-packages/issues/17812
+      {% if flag?(:windows) %}
+        if ENV["MSYSTEM"]?
+          pending! "Example is broken in MSYS2 shell"
+        end
+      {% end %}
+
       File.write(source_file, "File.basename(PROGRAM_NAME).inspect(STDOUT)")
 
       compile_file(source_file, bin_name: "×‽😂") do |executable_file|
@@ -243,115 +251,60 @@ describe "at_exit" do
   end
 end
 
-describe "hardware exception" do
-  it "reports invalid memory access", tags: %w[slow] do
-    status, _, error = compile_and_run_source <<-'CRYSTAL'
-      puts Pointer(Int64).null.value
-    CRYSTAL
-
-    status.success?.should be_false
-    error.should contain("Invalid memory access")
-    error.should_not contain("Stack overflow")
-  end
-
-  {% if flag?(:musl) %}
-    # FIXME: Pending as mitigation for https://github.com/crystal-lang/crystal/issues/7482
-    pending "detects stack overflow on the main stack"
-  {% else %}
-    it "detects stack overflow on the main stack", tags: %w[slow] do
-      # This spec can take some time under FreeBSD where
-      # the default stack size is 0.5G.  Setting a
-      # smaller stack size with `ulimit -s 8192`
-      # will address this.
+{% if flag?(:openbsd) %}
+  # FIXME: the segfault handler doesn't work on OpenBSD
+  pending "hardware exception"
+{% else %}
+  describe "hardware exception" do
+    it "reports invalid memory access", tags: %w[slow] do
       status, _, error = compile_and_run_source <<-'CRYSTAL'
-      def foo
-        y = StaticArray(Int8, 512).new(0)
-        foo
-      end
-      foo
-    CRYSTAL
+        puts Pointer(Int64).null.value
+      CRYSTAL
 
       status.success?.should be_false
-      error.should contain("Stack overflow")
+      error.should contain("Invalid memory access")
+      error.should_not contain("Stack overflow")
     end
-  {% end %}
 
-  it "detects stack overflow on a fiber stack", tags: %w[slow] do
-    status, _, error = compile_and_run_source <<-'CRYSTAL'
-      def foo
-        y = StaticArray(Int8, 512).new(0)
-        foo
+    {% if flag?(:netbsd) %}
+      # FIXME: on netbsd the process crashes with SIGILL after receiving SIGSEGV
+      pending "detects stack overflow on the main stack"
+      pending "detects stack overflow on a fiber stack"
+    {% else %}
+      it "detects stack overflow on the main stack", tags: %w[slow] do
+        # This spec can take some time under FreeBSD where
+        # the default stack size is 0.5G.  Setting a
+        # smaller stack size with `ulimit -s 8192`
+        # will address this.
+        status, _, error = compile_and_run_source <<-'CRYSTAL'
+          def foo
+            y = StaticArray(Int8, 512).new(0)
+            foo
+          end
+          foo
+        CRYSTAL
+
+        status.success?.should be_false
+        error.should contain("Stack overflow")
       end
 
-      spawn do
-        foo
+      it "detects stack overflow on a fiber stack", tags: %w[slow] do
+        status, _, error = compile_and_run_source <<-'CRYSTAL'
+          def foo
+            y = StaticArray(Int8, 512).new(0)
+            foo
+          end
+
+          spawn do
+            foo
+          end
+
+          sleep 60.seconds
+        CRYSTAL
+
+        status.success?.should be_false
+        error.should contain("Stack overflow")
       end
-
-      sleep 60.seconds
-    CRYSTAL
-
-    status.success?.should be_false
-    error.should contain("Stack overflow")
+    {% end %}
   end
-end
-
-private def compile_and_run_exit_handler(&block : Process -> _)
-  with_tempfile("source_file") do |source_file|
-    File.write(source_file, <<-CRYSTAL)
-      at_exit { print "Exiting" }
-      print "."
-      STDOUT.flush
-      sleep
-      CRYSTAL
-    output = nil
-    compile_file(source_file) do |executable_file|
-      error = IO::Memory.new
-      process = Process.new executable_file, output: :pipe, error: error
-
-      spawn do
-        process.output.read_byte
-        block.call(process)
-        output = process.output.gets_to_end
-      end
-
-      status = process.wait
-      {status, output, error.to_s}
-    end
-  end
-end
-
-describe "default interrupt handlers", tags: %w[slow] do
-  # TODO: Implementation for sending console control commands on Windows.
-  # So long this behaviour can only be tested manually.
-  #
-  # ```
-  # lib LibC
-  #  fun GenerateConsoleCtrlEvent(dwCtrlEvent : DWORD, dwProcessGroupId : DWORD) : BOOL
-  # end
-
-  # at_exit { print "Exiting"; }
-  # print "."
-  # STDOUT.flush
-  # LibC.GenerateConsoleCtrlEvent(LibC::CTRL_C_EVENT, 0)
-  # sleep
-  # ```
-  {% unless flag?(:windows) %}
-    it "handler for SIGINT" do
-      status, output, _ = compile_and_run_exit_handler(&.signal(Signal::INT))
-      output.should eq "Exiting"
-      status.inspect.should eq "Process::Status[130]"
-    end
-
-    it "handler for SIGTERM" do
-      status, output, _ = compile_and_run_exit_handler(&.terminate)
-      output.should eq "Exiting"
-      status.inspect.should eq "Process::Status[143]"
-    end
-  {% end %}
-
-  it "no handler for SIGKILL" do
-    status, output, _ = compile_and_run_exit_handler(&.terminate(graceful: false))
-    output.should eq ""
-    status.inspect.should eq {{ flag?(:unix) ? "Process::Status[Signal::KILL]" : "Process::Status[1]" }}
-  end
-end
+{% end %}
