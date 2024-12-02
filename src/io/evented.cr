@@ -1,4 +1,6 @@
-{% skip_file if flag?(:win32) %}
+require "crystal/event_loop"
+
+{% skip_file unless flag?(:wasi) || Crystal::EventLoop.has_constant?(:LibEvent) %}
 
 require "crystal/thread_local_value"
 
@@ -12,43 +14,6 @@ module IO::Evented
 
   @read_event = Crystal::ThreadLocalValue(Crystal::EventLoop::Event).new
   @write_event = Crystal::ThreadLocalValue(Crystal::EventLoop::Event).new
-
-  def evented_read(errno_msg : String, &) : Int32
-    loop do
-      bytes_read = yield
-      if bytes_read != -1
-        # `to_i32` is acceptable because `Slice#size` is an Int32
-        return bytes_read.to_i32
-      end
-
-      if Errno.value == Errno::EAGAIN
-        wait_readable
-      else
-        raise IO::Error.from_errno(errno_msg, target: self)
-      end
-    end
-  ensure
-    resume_pending_readers
-  end
-
-  def evented_write(errno_msg : String, &) : Int32
-    begin
-      loop do
-        bytes_written = yield
-        if bytes_written != -1
-          return bytes_written.to_i32
-        end
-
-        if Errno.value == Errno::EAGAIN
-          wait_writable
-        else
-          raise IO::Error.from_errno(errno_msg, target: self)
-        end
-      end
-    ensure
-      resume_pending_writers
-    end
-  end
 
   # :nodoc:
   def resume_read(timed_out = false) : Nil
@@ -132,13 +97,15 @@ module IO::Evented
     end
   end
 
-  private def resume_pending_readers
+  # :nodoc:
+  def evented_resume_pending_readers
     if (readers = @readers.get?) && !readers.empty?
       add_read_event
     end
   end
 
-  private def resume_pending_writers
+  # :nodoc:
+  def evented_resume_pending_writers
     if (writers = @writers.get?) && !writers.empty?
       add_write_event
     end

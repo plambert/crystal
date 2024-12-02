@@ -321,6 +321,7 @@ describe "String" do
     it { expect_raises(ArgumentError) { "1__234".to_i } }
     it { expect_raises(ArgumentError) { "1_234".to_i } }
     it { expect_raises(ArgumentError) { "   1234   ".to_i(whitespace: false) } }
+    it { expect_raises(ArgumentError) { "".to_i(whitespace: false) } }
     it { expect_raises(ArgumentError) { "0x123".to_i } }
     it { expect_raises(ArgumentError) { "0b123".to_i } }
     it { expect_raises(ArgumentError) { "000b123".to_i(prefix: true) } }
@@ -515,6 +516,7 @@ describe "String" do
     "nan".to_f?(whitespace: false).try(&.nan?).should be_true
     " nan".to_f?(whitespace: false).should be_nil
     "nan ".to_f?(whitespace: false).should be_nil
+    expect_raises(ArgumentError) { "".to_f(whitespace: false) }
     "nani".to_f?(strict: true).should be_nil
     " INF".to_f?.should eq Float64::INFINITY
     "INF".to_f?.should eq Float64::INFINITY
@@ -724,6 +726,10 @@ describe "String" do
     it { assert_prints "  spáçes before".titleize, "  Spáçes Before" }
     it { assert_prints "testá-se múitô".titleize, "Testá-se Múitô" }
     it { assert_prints "iO iO".titleize(Unicode::CaseOptions::Turkic), "İo İo" }
+    it { assert_prints "foo_Bar".titleize, "Foo_bar" }
+    it { assert_prints "foo_bar".titleize, "Foo_bar" }
+    it { assert_prints "testá_se múitô".titleize(underscore_to_space: true), "Testá Se Múitô" }
+    it { assert_prints "foo_bar".titleize(underscore_to_space: true), "Foo Bar" }
 
     it "handles multi-character mappings correctly (#13533)" do
       assert_prints "ﬄİ İﬄ ǳ Ǳ".titleize, "Ffli̇ İﬄ ǲ ǲ"
@@ -734,6 +740,12 @@ describe "String" do
       "a\xA0b".titleize.should eq("A\xA0b")
       String.build { |io| "\xB5!\xE0\xC1\xB5?".titleize(io) }.should eq("\xB5!\xE0\xC1\xB5?".scrub)
       String.build { |io| "a\xA0b".titleize(io) }.should eq("A\xA0b".scrub)
+    end
+
+    describe "with IO" do
+      it { String.build { |io| "foo_Bar".titleize io }.should eq "Foo_bar" }
+      it { String.build { |io| "foo_bar".titleize io }.should eq "Foo_bar" }
+      it { String.build { |io| "foo_bar".titleize(io, underscore_to_space: true) }.should eq "Foo Bar" }
     end
   end
 
@@ -761,6 +773,24 @@ describe "String" do
     it { "hello\n\n\n\n".chomp("").should eq("hello\n\n\n\n") }
 
     it { "hello\r\n".chomp("\n").should eq("hello") }
+
+    it "pre-computes string size if possible" do
+      {"!hello!", "\u{1f602}hello\u{1f602}", "\xFEhello\xFF"}.each do |str|
+        {"", "\n", "\r", "\r\n"}.each do |newline|
+          x = str + newline
+          x.size_known?.should be_true
+          y = x.chomp
+          y.@length.should eq(7)
+        end
+      end
+    end
+
+    it "does not pre-compute string size if not possible" do
+      x = String.build &.<< "abc\n"
+      x.size_known?.should be_false
+      y = x.chomp
+      y.size_known?.should be_false
+    end
   end
 
   describe "lchop" do
@@ -945,6 +975,8 @@ describe "String" do
       it { "日本語".index('本').should eq(1) }
       it { "bar".index('あ').should be_nil }
       it { "あいう_えお".index('_').should eq(3) }
+      it { "xyz\xFFxyz".index('\u{FFFD}').should eq(3) }
+      it { "日\xFF語".index('\u{FFFD}').should eq(1) }
 
       describe "with offset" do
         it { "foobarbaz".index('a', 5).should eq(7) }
@@ -952,6 +984,10 @@ describe "String" do
         it { "foo".index('g', 1).should be_nil }
         it { "foo".index('g', -20).should be_nil }
         it { "日本語日本語".index('本', 2).should eq(4) }
+        it { "xyz\xFFxyz".index('\u{FFFD}', 2).should eq(3) }
+        it { "xyz\xFFxyz".index('\u{FFFD}', 4).should be_nil }
+        it { "日本\xFF語".index('\u{FFFD}', 2).should eq(2) }
+        it { "日本\xFF語".index('\u{FFFD}', 3).should be_nil }
 
         # Check offset type
         it { "foobarbaz".index('a', 5_i64).should eq(7) }
@@ -1094,6 +1130,8 @@ describe "String" do
       it { "foobar".rindex('g').should be_nil }
       it { "日本語日本語".rindex('本').should eq(4) }
       it { "あいう_えお".rindex('_').should eq(3) }
+      it { "xyz\xFFxyz".rindex('\u{FFFD}').should eq(3) }
+      it { "日\xFF語".rindex('\u{FFFD}').should eq(1) }
 
       describe "with offset" do
         it { "bbbb".rindex('b', 2).should eq(2) }
@@ -1106,6 +1144,10 @@ describe "String" do
         it { "faobar".rindex('a', 3).should eq(1) }
         it { "faobarbaz".rindex('a', -3).should eq(4) }
         it { "日本語日本語".rindex('本', 3).should eq(1) }
+        it { "xyz\xFFxyz".rindex('\u{FFFD}', 4).should eq(3) }
+        it { "xyz\xFFxyz".rindex('\u{FFFD}', 2).should be_nil }
+        it { "日本\xFF語".rindex('\u{FFFD}', 2).should eq(2) }
+        it { "日本\xFF語".rindex('\u{FFFD}', 1).should be_nil }
 
         # Check offset type
         it { "bbbb".rindex('b', 2_i64).should eq(2) }
@@ -2806,7 +2848,7 @@ describe "String" do
         bytes.to_a.should eq([72, 0, 101, 0, 108, 0, 108, 0, 111, 0])
       end
 
-      {% unless flag?(:musl) || flag?(:solaris) || flag?(:freebsd) || flag?(:dragonfly) %}
+      {% unless flag?(:musl) || flag?(:solaris) || flag?(:freebsd) || flag?(:dragonfly) || flag?(:netbsd) %}
         it "flushes the shift state (#11992)" do
           "\u{00CA}".encode("BIG5-HKSCS").should eq(Bytes[0x88, 0x66])
           "\u{00CA}\u{0304}".encode("BIG5-HKSCS").should eq(Bytes[0x88, 0x62])
@@ -2815,7 +2857,7 @@ describe "String" do
 
       # FreeBSD iconv encoder expects ISO/IEC 10646 compatibility code points,
       # see https://www.ccli.gov.hk/doc/e_hkscs_2008.pdf for details.
-      {% if flag?(:freebsd) || flag?(:dragonfly) %}
+      {% if flag?(:freebsd) || flag?(:dragonfly) || flag?(:netbsd) %}
         it "flushes the shift state (#11992)" do
           "\u{F329}".encode("BIG5-HKSCS").should eq(Bytes[0x88, 0x66])
           "\u{F325}".encode("BIG5-HKSCS").should eq(Bytes[0x88, 0x62])
@@ -2859,7 +2901,7 @@ describe "String" do
         String.new(bytes, "UTF-16LE").should eq("Hello")
       end
 
-      {% unless flag?(:solaris) || flag?(:freebsd) || flag?(:dragonfly) %}
+      {% unless flag?(:solaris) || flag?(:freebsd) || flag?(:dragonfly) || flag?(:netbsd) %}
         it "decodes with shift state" do
           String.new(Bytes[0x88, 0x66], "BIG5-HKSCS").should eq("\u{00CA}")
           String.new(Bytes[0x88, 0x62], "BIG5-HKSCS").should eq("\u{00CA}\u{0304}")
@@ -2868,7 +2910,7 @@ describe "String" do
 
       # FreeBSD iconv decoder returns ISO/IEC 10646-1:2000 code points,
       # see https://www.ccli.gov.hk/doc/e_hkscs_2008.pdf for details.
-      {% if flag?(:freebsd) || flag?(:dragonfly) %}
+      {% if flag?(:freebsd) || flag?(:dragonfly) || flag?(:netbsd) %}
         it "decodes with shift state" do
           String.new(Bytes[0x88, 0x66], "BIG5-HKSCS").should eq("\u{00CA}")
           String.new(Bytes[0x88, 0x62], "BIG5-HKSCS").should eq("\u{F325}")
