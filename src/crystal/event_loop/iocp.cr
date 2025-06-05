@@ -1,146 +1,267 @@
-require "c/ioapiset"
-require "crystal/system/print_error"
+# forward declaration for the require below to not create a module
+class Crystal::EventLoop::IOCP < Crystal::EventLoop
+end
+
+require "c/ntdll"
 require "../system/win32/iocp"
+require "../system/win32/waitable_timer"
+require "./timers"
+require "./iocp/*"
 
 # :nodoc:
 class Crystal::EventLoop::IOCP < Crystal::EventLoop
-  # This is a list of resume and timeout events managed outside of IOCP.
-  @queue = Deque(Event).new
-
-  @lock = Crystal::SpinLock.new
-  @interrupted = Atomic(Bool).new(false)
-  @blocked_thread = Atomic(Thread?).new(nil)
-
-  # Returns the base IO Completion Port
-  getter iocp : LibC::HANDLE do
-    create_completion_port(LibC::INVALID_HANDLE_VALUE, nil)
+  def self.default_file_blocking?
+    # here, blocking refers to setting FILE_FLAG_OVERLAPPED (non blocking) or
+    # not (blocking)
+    false
   end
 
-  def create_completion_port(handle : LibC::HANDLE, parent : LibC::HANDLE? = iocp)
-    iocp = LibC.CreateIoCompletionPort(handle, parent, nil, 0)
-    if iocp.null?
-      raise IO::Error.from_winerror("CreateIoCompletionPort")
-    end
-    if parent
-      # all overlapped operations may finish synchronously, in which case we do
-      # not reschedule the running fiber; the following call tells Win32 not to
-      # queue an I/O completion packet to the associated IOCP as well, as this
-      # would be done by default
-      if LibC.SetFileCompletionNotificationModes(handle, LibC::FILE_SKIP_COMPLETION_PORT_ON_SUCCESS) == 0
-        raise IO::Error.from_winerror("SetFileCompletionNotificationModes")
-      end
-    end
-    iocp
-  end
-
-  # Runs the event loop and enqueues the fiber for the next upcoming event or
-  # completion.
-  def run(blocking : Bool) : Bool
-    # Pull the next upcoming event from the event queue. This determines the
-    # timeout for waiting on the completion port.
-    # OPTIMIZE: Implement @queue as a priority queue in order to avoid this
-    # explicit search for the lowest value and dequeue more efficient.
-    next_event = @queue.min_by?(&.wake_at)
-
-    # no registered events: nothing to wait for
-    return false unless next_event
-
-    now = Time.monotonic
-
-    if next_event.wake_at > now
-      # There is no event ready to wake. We wait for completions until the next
-      # event wake time, unless nonblocking or already interrupted (timeout
-      # immediately).
-      if blocking
-        @lock.sync do
-          if @interrupted.get(:acquire)
-            blocking = false
-          else
-            # memorize the blocked thread (so we can alert it)
-            @blocked_thread.set(Thread.current, :release)
-          end
-        end
-      end
-
-      wait_time = blocking ? (next_event.wake_at - now).total_milliseconds : 0
-      timed_out = System::IOCP.wait_queued_completions(wait_time, alertable: blocking) do |fiber|
-        # This block may run multiple times. Every single fiber gets enqueued.
-        fiber.enqueue
-      end
-
-      @blocked_thread.set(nil, :release)
-      @interrupted.set(false, :release)
-
-      # The wait for completion enqueued events.
-      return true unless timed_out
-
-      # Wait for completion timed out but it may have been interrupted or we ask
-      # for immediate timeout (nonblocking), so we check for the next event
-      # readiness again:
-      return false if next_event.wake_at > Time.monotonic
-    end
-
-    # next_event gets activated because its wake time is passed, either from the
-    # start or because completion wait has timed out.
-
-    dequeue next_event
-
-    fiber = next_event.fiber
-
-    # If the waiting fiber was already shut down in the mean time, we can just
-    # abandon here. There's no need to go for the next event because the scheduler
-    # will just try again.
-    # OPTIMIZE: It might still be worth considering to start over from the top
-    # or call recursively, in order to ensure at least one fiber get enqueued.
-    # This would avoid the scheduler needing to looking at runnable again just
-    # to notice it's still empty. The lock involved there should typically be
-    # uncontested though, so it's probably not a big deal.
-    return false if fiber.dead?
-
-    # A timeout event needs special handling because it does not necessarily
-    # means to resume the fiber directly, in case a different select branch
-    # was already activated.
-    if next_event.timeout? && (select_action = fiber.timeout_select_action)
-      fiber.timeout_select_action = nil
-      select_action.time_expired(fiber)
-    else
-      fiber.enqueue
-    end
-
-    # We enqueued a fiber.
+  def self.default_socket_blocking?
+    # here, blocking refers to the (non)blocking mode of winsocks, it is
+    # independent from the WSA_FLAG_OVERLAPPED that we always set
     true
   end
 
+  @waitable_timer : System::WaitableTimer?
+  @timer_packet : LibC::HANDLE?
+  @timer_key : System::IOCP::CompletionKey?
+
+  def initialize
+    @mutex = Thread::Mutex.new
+    @timers = Timers(Timer).new
+
+    # the completion port
+    @iocp = System::IOCP.new
+
+    # custom completion to interrupt a blocking run
+    @interrupted = Atomic(Bool).new(false)
+    @interrupt_key = System::IOCP::CompletionKey.new(:interrupt)
+
+    # On Windows 10+ we leverage a high resolution timer with completion packet
+    # to notify a completion port; on legacy Windows we fallback to the low
+    # resolution timeout (~15.6ms)
+    if System::IOCP.wait_completion_packet_methods?
+      @waitable_timer = System::WaitableTimer.new
+      @timer_packet = @iocp.create_wait_completion_packet
+      @timer_key = System::IOCP::CompletionKey.new(:timer)
+    end
+  end
+
+  # Returns the base IO Completion Port.
+  def iocp_handle : LibC::HANDLE
+    @iocp.handle
+  end
+
+  def create_completion_port(handle : LibC::HANDLE) : LibC::HANDLE
+    iocp = LibC.CreateIoCompletionPort(handle, @iocp.handle, nil, 0)
+    raise IO::Error.from_winerror("CreateIoCompletionPort") if iocp.null?
+
+    # all overlapped operations may finish synchronously, in which case we do
+    # not reschedule the running fiber; the following call tells Win32 not to
+    # queue an I/O completion packet to the associated IOCP as well, as this
+    # would be done by default
+    if LibC.SetFileCompletionNotificationModes(handle, LibC::FILE_SKIP_COMPLETION_PORT_ON_SUCCESS) == 0
+      raise IO::Error.from_winerror("SetFileCompletionNotificationModes")
+    end
+
+    iocp
+  end
+
+  # thread unsafe
+  def run(blocking : Bool) : Bool
+    enqueued = false
+
+    run_impl(blocking) do |fiber|
+      fiber.enqueue
+      enqueued = true
+    end
+
+    enqueued
+  end
+
+  {% if flag?(:execution_context) %}
+    # thread unsafe
+    def run(queue : Fiber::List*, blocking : Bool) : Nil
+      run_impl(blocking) { |fiber| queue.value.push(fiber) }
+    end
+  {% end %}
+
+  # Runs the event loop and enqueues the fiber for the next upcoming event or
+  # completion.
+  private def run_impl(blocking : Bool, &) : Nil
+    Crystal.trace :evloop, "run", blocking: blocking ? 1 : 0
+
+    if @waitable_timer
+      timeout = blocking ? LibC::INFINITE : 0_i64
+    elsif blocking
+      if time = @mutex.synchronize { @timers.next_ready? }
+        # convert absolute time of next timer to relative time, expressed in
+        # milliseconds, rounded up
+        seconds, nanoseconds = System::Time.monotonic
+        relative = time - Time::Span.new(seconds: seconds, nanoseconds: nanoseconds)
+        timeout = (relative.to_i * 1000 + (relative.nanoseconds + 999_999) // 1_000_000).clamp(0_i64..)
+      else
+        timeout = LibC::INFINITE
+      end
+    else
+      timeout = 0_i64
+    end
+
+    # the array must be at least as large as `overlapped_entries` in
+    # `System::IOCP#wait_queued_completions`
+    events = uninitialized FiberEvent[64]
+    size = 0
+
+    @iocp.wait_queued_completions(timeout) do |fiber|
+      if (event = fiber.@resume_event) && event.wake_at?
+        events[size] = event
+        size += 1
+      end
+      yield fiber
+    end
+
+    @mutex.synchronize do
+      # cancel the timeout of completed operations
+      events.to_slice[0...size].each do |event|
+        @timers.delete(pointerof(event.@timer))
+        event.clear
+      end
+
+      # run expired timers
+      @timers.dequeue_ready do |timer|
+        process_timer(timer) { |fiber| yield fiber }
+      end
+
+      # update timer
+      rearm_waitable_timer(@timers.next_ready?, interruptible: false)
+    end
+
+    @interrupted.set(false, :release)
+  end
+
+  private def process_timer(timer : Pointer(Timer), &)
+    fiber = timer.value.fiber
+
+    case timer.value.type
+    in .sleep?, .timeout?
+      timer.value.timed_out!
+    in .select_timeout?
+      return unless select_action = fiber.timeout_select_action
+      fiber.timeout_select_action = nil
+      return unless select_action.time_expired?
+      fiber.@timeout_event.as(FiberEvent).clear
+    end
+
+    yield fiber
+  end
+
   def interrupt : Nil
-    thread = nil
-
-    @lock.sync do
-      @interrupted.set(true)
-      thread = @blocked_thread.swap(nil, :acquire)
-    end
-    return unless thread
-
-    # alert the thread to interrupt GetQueuedCompletionStatusEx
-    LibC.QueueUserAPC(->(ptr : LibC::ULONG_PTR) { }, thread, LibC::ULONG_PTR.new(0))
-  end
-
-  def enqueue(event : Event)
-    unless @queue.includes?(event)
-      @queue << event
+    unless @interrupted.get(:acquire)
+      @iocp.post_queued_completion_status(@interrupt_key)
     end
   end
 
-  def dequeue(event : Event)
-    @queue.delete(event)
+  protected def add_timer(timer : Pointer(Timer)) : Nil
+    @mutex.synchronize do
+      is_next_ready = @timers.add(timer)
+      rearm_waitable_timer(timer.value.wake_at, interruptible: true) if is_next_ready
+    end
   end
 
-  # Create a new resume event for a fiber.
-  def create_resume_event(fiber : Fiber) : Crystal::EventLoop::Event
-    Event.new(fiber)
+  protected def delete_timer(timer : Pointer(Timer)) : Nil
+    @mutex.synchronize do
+      _, was_next_ready = @timers.delete(timer)
+      rearm_waitable_timer(@timers.next_ready?, interruptible: false) if was_next_ready
+    end
   end
 
-  def create_timeout_event(fiber) : Crystal::EventLoop::Event
-    Event.new(fiber, timeout: true)
+  protected def rearm_waitable_timer(time : Time::Span?, interruptible : Bool) : Nil
+    if waitable_timer = @waitable_timer
+      status = @iocp.cancel_wait_completion_packet(@timer_packet.not_nil!, true)
+      if time
+        waitable_timer.set(time)
+        if status == LibC::STATUS_PENDING
+          interrupt
+        else
+          # STATUS_CANCELLED, STATUS_SUCCESS
+          @iocp.associate_wait_completion_packet(@timer_packet.not_nil!, waitable_timer.handle, @timer_key.not_nil!)
+        end
+      else
+        waitable_timer.cancel
+      end
+    elsif interruptible
+      interrupt
+    end
+  end
+
+  def sleep(duration : Time::Span) : Nil
+    timer = Timer.new(:sleep, Fiber.current, duration)
+    add_timer(pointerof(timer))
+    Fiber.suspend
+
+    # safety check
+    return if timer.timed_out?
+
+    # try to avoid a double resume if possible, but another thread might be
+    # running the evloop and dequeue the event in parallel, so a "can't resume
+    # dead fiber" can still happen in a MT execution context.
+    delete_timer(pointerof(timer))
+    raise "BUG: #{timer.fiber} called sleep but was manually resumed before the timer expired!"
+  end
+
+  # Suspend the current fiber for *duration* and returns true if the timer
+  # expired and false if the fiber was resumed early.
+  #
+  # Specific to IOCP to handle IO timeouts.
+  def timeout(duration : Time::Span) : Bool
+    event = Fiber.current.resume_event
+    event.add(duration)
+
+    Fiber.suspend
+
+    if event.timed_out?
+      true
+    else
+      event.delete
+      false
+    end
+  end
+
+  def create_resume_event(fiber : Fiber) : EventLoop::Event
+    FiberEvent.new(:timeout, fiber)
+  end
+
+  def create_timeout_event(fiber : Fiber) : EventLoop::Event
+    FiberEvent.new(:select_timeout, fiber)
+  end
+
+  def pipe(read_blocking : Bool?, write_blocking : Bool?) : {IO::FileDescriptor, IO::FileDescriptor}
+    r, w = System::FileDescriptor.system_pipe(!!read_blocking, !!write_blocking)
+    {
+      IO::FileDescriptor.new(r, !!read_blocking),
+      IO::FileDescriptor.new(w, !!write_blocking),
+    }
+  end
+
+  def open(path : String, flags : Int32, permissions : File::Permissions, blocking : Bool?) : {System::FileDescriptor::Handle, Bool} | WinError
+    access, disposition, attributes = System::File.posix_to_open_opts(flags, permissions, blocking)
+
+    handle = LibC.CreateFileW(
+      System.to_wstr(path),
+      access,
+      LibC::DEFAULT_SHARE_MODE, # UNIX semantics
+      nil,
+      disposition,
+      attributes,
+      LibC::HANDLE.null
+    )
+
+    if handle == LibC::INVALID_HANDLE_VALUE
+      WinError.value
+    else
+      create_completion_port(handle) unless blocking
+      {handle.address, !!blocking}
+    end
   end
 
   def read(file_descriptor : Crystal::System::FileDescriptor, slice : Bytes) : Int32
@@ -150,18 +271,53 @@ class Crystal::EventLoop::IOCP < Crystal::EventLoop
     end.to_i32
   end
 
+  def wait_readable(file_descriptor : Crystal::System::FileDescriptor) : Nil
+    raise NotImplementedError.new("Crystal::System::IOCP#wait_readable(FileDescriptor)")
+  end
+
   def write(file_descriptor : Crystal::System::FileDescriptor, slice : Bytes) : Int32
-    System::IOCP.overlapped_operation(file_descriptor, "WriteFile", file_descriptor.write_timeout, writing: true) do |overlapped|
+    bytes_written = System::IOCP.overlapped_operation(file_descriptor, "WriteFile", file_descriptor.write_timeout, writing: true) do |overlapped|
+      overlapped.offset = UInt64::MAX if file_descriptor.system_append?
+
       ret = LibC.WriteFile(file_descriptor.windows_handle, slice, slice.size, out byte_count, overlapped)
       {ret, byte_count}
     end.to_i32
+
+    # The overlapped offset forced a write to the end of the file, but unlike
+    # synchronous writes, an asynchronous write incorrectly updates the file
+    # pointer: it merely adds the number of written bytes to the current
+    # position, disregarding that the offset might have changed it.
+    #
+    # We could seek before the async write (it works), but a concurrent fiber or
+    # parallel thread could also seek and we'd end up overwriting instead of
+    # appending; we need both the offset + explicit seek.
+    file_descriptor.system_seek(0, IO::Seek::End) if file_descriptor.system_append?
+
+    bytes_written
+  end
+
+  def wait_writable(file_descriptor : Crystal::System::FileDescriptor) : Nil
+    raise NotImplementedError.new("Crystal::System::IOCP#wait_writable(FileDescriptor)")
+  end
+
+  def reopened(file_descriptor : Crystal::System::FileDescriptor) : Nil
+    raise NotImplementedError.new("Crystal::System::IOCP#reopened(FileDescriptor)")
   end
 
   def close(file_descriptor : Crystal::System::FileDescriptor) : Nil
     LibC.CancelIoEx(file_descriptor.windows_handle, nil) unless file_descriptor.system_blocking?
+    file_descriptor.file_descriptor_close
   end
 
-  def remove(file_descriptor : Crystal::System::FileDescriptor) : Nil
+  def socket(family : ::Socket::Family, type : ::Socket::Type, protocol : ::Socket::Protocol, blocking : Bool?) : {::Socket::Handle, Bool}
+    blocking = true if blocking.nil?
+    fd = System::Socket.socket(family, type, protocol, blocking)
+    create_completion_port LibC::HANDLE.new(fd)
+    {fd, blocking}
+  end
+
+  def socketpair(type : ::Socket::Type, protocol : ::Socket::Protocol) : Tuple({::Socket::Handle, ::Socket::Handle}, Bool)
+    raise NotImplementedError.new("Crystal::EventLoop::IOCP#socketpair")
   end
 
   private def wsa_buffer(bytes)
@@ -183,6 +339,13 @@ class Crystal::EventLoop::IOCP < Crystal::EventLoop
     bytes_read.to_i32
   end
 
+  def wait_readable(socket : ::Socket) : Nil
+    # NOTE: Windows 10+ has `ProcessSocketNotifications` to associate sockets to
+    # a completion port and be notified of socket readiness. See
+    # <https://learn.microsoft.com/en-us/windows/win32/winsock/winsock-socket-state-notifications>
+    raise NotImplementedError.new("Crystal::System::IOCP#wait_readable(Socket)")
+  end
+
   def write(socket : ::Socket, slice : Bytes) : Int32
     wsabuf = wsa_buffer(slice)
 
@@ -192,6 +355,13 @@ class Crystal::EventLoop::IOCP < Crystal::EventLoop
     end
 
     bytes.to_i32
+  end
+
+  def wait_writable(socket : ::Socket) : Nil
+    # NOTE: Windows 10+ has `ProcessSocketNotifications` to associate sockets to
+    # a completion port and be notified of socket readiness. See
+    # <https://learn.microsoft.com/en-us/windows/win32/winsock/winsock-socket-state-notifications>
+    raise NotImplementedError.new("Crystal::System::IOCP#wait_writable(Socket)")
   end
 
   def send_to(socket : ::Socket, slice : Bytes, address : ::Socket::Address) : Int32
@@ -237,7 +407,7 @@ class Crystal::EventLoop::IOCP < Crystal::EventLoop
     end
   end
 
-  def accept(socket : ::Socket) : ::Socket::Handle?
+  def accept(socket : ::Socket) : {::Socket::Handle, Bool}?
     socket.system_accept do |client_handle|
       address_size = sizeof(LibC::SOCKADDR_STORAGE) + 16
 
@@ -273,33 +443,6 @@ class Crystal::EventLoop::IOCP < Crystal::EventLoop
   end
 
   def close(socket : ::Socket) : Nil
-  end
-
-  def remove(socket : ::Socket) : Nil
-  end
-end
-
-class Crystal::EventLoop::IOCP::Event
-  include Crystal::EventLoop::Event
-
-  getter fiber
-  getter wake_at
-  getter? timeout
-
-  def initialize(@fiber : Fiber, @wake_at = Time.monotonic, *, @timeout = false)
-  end
-
-  # Frees the event
-  def free : Nil
-    Crystal::EventLoop.current.dequeue(self)
-  end
-
-  def delete
-    free
-  end
-
-  def add(timeout : Time::Span) : Nil
-    @wake_at = Time.monotonic + timeout
-    Crystal::EventLoop.current.enqueue(self)
+    raise NotImplementedError.new("Crystal::System::IOCP#close(Socket)")
   end
 end

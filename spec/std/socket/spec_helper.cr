@@ -2,7 +2,9 @@ require "spec"
 require "socket"
 
 module SocketSpecHelper
-  class_getter?(supports_ipv6 : Bool) do
+  class_getter?(supports_ipv6 : Bool) { detect_supports_ipv6? }
+
+  private def self.detect_supports_ipv6? : Bool
     TCPServer.open("::1", 0) { return true }
     false
   rescue Socket::Error
@@ -32,8 +34,18 @@ def each_ip_family(&block : Socket::Family, String, String ->)
   end
 end
 
-def unused_local_port
+def unused_local_tcp_port
   TCPServer.open(Socket::IPAddress::UNSPECIFIED, 0) do |server|
     server.local_address.port
+  end
+end
+
+def unused_local_udp_port
+  socket = UDPSocket.new
+  begin
+    socket.bind(Socket::IPAddress::UNSPECIFIED, 0)
+    socket.local_address.port
+  ensure
+    socket.close
   end
 end

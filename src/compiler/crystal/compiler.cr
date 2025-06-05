@@ -699,7 +699,7 @@ module Crystal
         if @progress_tracker.stats?
           if result["reused"].as_bool
             name = result["name"].as_s
-            unit = units.find { |unit| unit.name == name }.not_nil!
+            unit = units.find! { |unit| unit.name == name }
             unit.reused_previous_compilation = true
           end
         end
@@ -876,16 +876,17 @@ module Crystal
 
       status = $?
       unless status.success?
-        if status.normal_exit?
-          case status.exit_code
-          when 126
-            linker_not_found File::AccessDeniedError, linker_name
-          when 127
-            linker_not_found File::NotFoundError, linker_name
-          end
+        exit_code = status.exit_code?
+        case exit_code
+        when 126
+          linker_not_found File::AccessDeniedError, linker_name
+        when 127
+          linker_not_found File::NotFoundError, linker_name
+        when nil
+          # abnormal exit
+          exit_code = 1
         end
-        code = status.normal_exit? ? status.exit_code : 1
-        error "execution of command failed with exit status #{status}: #{command}", exit_code: code
+        error "execution of command failed with exit status #{status}: #{command}", exit_code: exit_code
       end
     end
 

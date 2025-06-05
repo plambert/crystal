@@ -22,7 +22,6 @@ all:
 ##   $ make -B generate_data
 
 CRYSTAL ?= crystal## which previous crystal compiler use
-LLVM_CONFIG ?=     ## llvm-config command path to use
 
 release ?=        ## Compile in release mode
 stats ?=          ## Enable statistics output
@@ -41,6 +40,7 @@ deref_symlinks ?= ## Deference symbolic links for `make install`
 O := .build
 SOURCES := $(shell find src -name '*.cr')
 SPEC_SOURCES := $(shell find spec -name '*.cr')
+MAN1PAGES := $(patsubst doc/man/%.adoc,man/%.1,$(wildcard doc/man/*.adoc))
 override FLAGS += -D strict_multi_assign -D preview_overload_order $(if $(release),--release )$(if $(stats),--stats )$(if $(progress),--progress )$(if $(threads),--threads $(threads) )$(if $(debug),-d )$(if $(static),--static )$(if $(LDFLAGS),--link-flags="$(LDFLAGS)" )$(if $(target),--cross-compile --target $(target) )$(if $(interpreter),,-Dwithout_interpreter )
 SPEC_WARNINGS_OFF := --exclude-warnings spec/std --exclude-warnings spec/compiler --exclude-warnings spec/primitives
 override SPEC_FLAGS += $(if $(verbose),-v )$(if $(junit_output),--junit_output $(junit_output) )$(if $(order),--order=$(order) )
@@ -61,8 +61,12 @@ override EXPORTS_BUILD += \
 	$(EXPORT_CC) \
 	CRYSTAL_CONFIG_LIBRARY_PATH=$(CRYSTAL_CONFIG_LIBRARY_PATH)
 SHELL = sh
-LLVM_CONFIG := $(shell src/llvm/ext/find-llvm-config)
-LLVM_VERSION := $(if $(LLVM_CONFIG),$(shell "$(LLVM_CONFIG)" --version 2> /dev/null))
+
+ifeq ($(LLVM_VERSION),)
+  LLVM_CONFIG ?= $(shell src/llvm/ext/find-llvm-config.sh)
+  LLVM_VERSION ?= $(if $(LLVM_CONFIG),$(shell "$(LLVM_CONFIG)" --version 2> /dev/null))
+endif
+
 LLVM_EXT_DIR = src/llvm/ext
 LLVM_EXT_OBJ = $(LLVM_EXT_DIR)/llvm_ext.o
 CXXFLAGS += $(if $(debug),-g -O0)
@@ -79,10 +83,11 @@ CRYSTAL_BIN := crystal$(EXE)
 
 DESTDIR ?=
 PREFIX ?= /usr/local
-BINDIR ?= $(DESTDIR)$(PREFIX)/bin
-MANDIR ?= $(DESTDIR)$(PREFIX)/share/man
-LIBDIR ?= $(DESTDIR)$(PREFIX)/lib
-DATADIR ?= $(DESTDIR)$(PREFIX)/share/crystal
+BINDIR ?= $(PREFIX)/bin
+LIBDIR ?= $(PREFIX)/lib
+DATADIR ?= $(PREFIX)/share
+DOCDIR ?= $(DATADIR)/doc/crystal
+MANDIR ?= $(DATADIR)/man
 INSTALL ?= /usr/bin/install
 
 ifeq ($(or $(TERM),$(TERM),dumb),dumb)
@@ -100,8 +105,8 @@ endif
 
 check_llvm_config = $(eval \
 	check_llvm_config := $(if $(LLVM_VERSION),\
-	  $(call colorize,Using $(LLVM_CONFIG) [version=$(LLVM_VERSION)]),\
-	  $(error "Could not locate compatible llvm-config, make sure it is installed and in your PATH, or set LLVM_CONFIG. Compatible versions: $(shell cat src/llvm/ext/llvm-versions.txt)))\
+		$(call colorize,Using $(or $(LLVM_CONFIG),externally configured LLVM) [version=$(LLVM_VERSION)]),\
+		$(error "Could not locate compatible llvm-config, make sure it is installed and in your PATH, or set LLVM_VERSION / LLVM_CONFIG. Compatible versions: $(shell cat src/llvm/ext/llvm-versions.txt)))\
 	)
 
 .PHONY: all
@@ -132,6 +137,12 @@ interpreter_spec: $(O)/interpreter_spec$(EXE) ## Run interpreter specs
 .PHONY: smoke_test
 smoke_test: ## Build specs as a smoke test
 smoke_test: $(O)/std_spec$(EXE) $(O)/compiler_spec$(EXE) $(O)/$(CRYSTAL_BIN)
+
+SHELLCHECK_SOURCES := $(wildcard **/*.sh) bin/crystal bin/ci bin/check-compiler-flag scripts/git/pre-commit
+
+.PHONY: lint-shellcheck
+lint-shellcheck:
+	shellcheck --severity=warning $(SHELLCHECK_SOURCES)
 
 .PHONY: all_spec
 all_spec: $(O)/all_spec$(EXE) ## Run all specs (note: this builds a huge program; `test` recipe builds individual binaries and is recommended for reduced resource usage)
@@ -164,55 +175,56 @@ generate_data: ## Run generator scripts for Unicode, SSL config, ...
 
 .PHONY: install
 install: $(O)/$(CRYSTAL_BIN) man/crystal.1.gz ## Install the compiler at DESTDIR
-	$(INSTALL) -d -m 0755 "$(BINDIR)/"
-	$(INSTALL) -m 0755 "$(O)/$(CRYSTAL_BIN)" "$(BINDIR)/$(CRYSTAL_BIN)"
+	$(INSTALL) -d -m 0755 "$(DESTDIR)$(BINDIR)/"
+	$(INSTALL) -m 0755 "$(O)/$(CRYSTAL_BIN)" "$(DESTDIR)$(BINDIR)/$(CRYSTAL_BIN)"
 
-	$(INSTALL) -d -m 0755 $(DATADIR)
-	cp -R -p $(if $(deref_symlinks),-L,-P) src "$(DATADIR)/src"
-	rm -rf "$(DATADIR)/$(LLVM_EXT_OBJ)" # Don't install llvm_ext.o
+	$(INSTALL) -d -m 0755 $(DESTDIR)$(DATADIR)/crystal
+	cp -R -p $(if $(deref_symlinks),-L,-P) src "$(DESTDIR)$(DATADIR)/crystal/src"
+	rm -rf "$(DESTDIR)$(DATADIR)/crystal/$(LLVM_EXT_OBJ)" # Don't install llvm_ext.o
 
-	$(INSTALL) -d -m 0755 "$(MANDIR)/man1/"
-	$(INSTALL) -m 644 man/crystal.1.gz "$(MANDIR)/man1/crystal.1.gz"
-	$(INSTALL) -d -m 0755 "$(DESTDIR)$(PREFIX)/share/licenses/crystal/"
-	$(INSTALL) -m 644 LICENSE "$(DESTDIR)$(PREFIX)/share/licenses/crystal/LICENSE"
+	$(INSTALL) -d -m 0755 "$(DESTDIR)$(MANDIR)/man1/"
+	$(INSTALL) -m 644 man/crystal.1.gz "$(DESTDIR)$(MANDIR)/man1/crystal.1.gz"
+	$(INSTALL) -d -m 0755 "$(DESTDIR)$(DATADIR)/licenses/crystal/"
+	$(INSTALL) -m 644 LICENSE "$(DESTDIR)$(DATADIR)/licenses/crystal/LICENSE"
 
-	$(INSTALL) -d -m 0755 "$(DESTDIR)$(PREFIX)/share/bash-completion/completions/"
-	$(INSTALL) -m 644 etc/completion.bash "$(DESTDIR)$(PREFIX)/share/bash-completion/completions/crystal"
-	$(INSTALL) -d -m 0755 "$(DESTDIR)$(PREFIX)/share/zsh/site-functions/"
-	$(INSTALL) -m 644 etc/completion.zsh "$(DESTDIR)$(PREFIX)/share/zsh/site-functions/_crystal"
-	$(INSTALL) -d -m 0755 "$(DESTDIR)$(PREFIX)/share/fish/vendor_completions.d/"
-	$(INSTALL) -m 644 etc/completion.fish "$(DESTDIR)$(PREFIX)/share/fish/vendor_completions.d/crystal.fish"
+	$(INSTALL) -d -m 0755 "$(DESTDIR)$(DATADIR)/bash-completion/completions/"
+	$(INSTALL) -m 644 etc/completion.bash "$(DESTDIR)$(DATADIR)/bash-completion/completions/crystal"
+	$(INSTALL) -d -m 0755 "$(DESTDIR)$(DATADIR)/zsh/site-functions/"
+	$(INSTALL) -m 644 etc/completion.zsh "$(DESTDIR)$(DATADIR)/zsh/site-functions/_crystal"
+	$(INSTALL) -d -m 0755 "$(DESTDIR)$(DATADIR)/fish/vendor_completions.d/"
+	$(INSTALL) -m 644 etc/completion.fish "$(DESTDIR)$(DATADIR)/fish/vendor_completions.d/crystal.fish"
 
 ifeq ($(WINDOWS),1)
 .PHONY: install_dlls
 install_dlls: $(O)/$(CRYSTAL_BIN) ## Install the compiler's dependent DLLs at DESTDIR (Windows only)
-	$(INSTALL) -d -m 0755 "$(BINDIR)/"
-	@ldd $(O)/$(CRYSTAL_BIN) | grep -iv ' => /c/windows/system32' | sed 's/.* => //; s/ (.*//' | xargs -t -i $(INSTALL) -m 0755 '{}' "$(BINDIR)/"
+	$(INSTALL) -d -m 0755 "$(DESTDIR)$(BINDIR)/"
+	@ldd $(O)/$(CRYSTAL_BIN) | grep -iv ' => /c/windows/system32' | sed 's/.* => //; s/ (.*//' | xargs -t -i $(INSTALL) -m 0755 '{}' "$(DESTDIR)$(BINDIR)/"
 endif
 
 .PHONY: uninstall
 uninstall: ## Uninstall the compiler from DESTDIR
-	rm -f "$(BINDIR)/$(CRYSTAL_BIN)"
+	rm -f "$(DESTDIR)$(BINDIR)/$(CRYSTAL_BIN)"
 
-	rm -rf "$(DATADIR)/src"
+	rm -rf "$(DESTDIR)$(DATADIR)/crystal/src"
 
-	rm -f "$(MANDIR)/man1/crystal.1.gz"
-	rm -f "$(DESTDIR)$(PREFIX)/share/licenses/crystal/LICENSE"
+	rm -f "$(DESTDIR)$(MANDIR)/man1/crystal.1.gz"
+	rm -f "$(DESTDIR)$(DATADIR)/licenses/crystal/LICENSE"
 
-	rm -f "$(DESTDIR)$(PREFIX)/share/bash-completion/completions/crystal"
-	rm -f "$(DESTDIR)$(PREFIX)/share/zsh/site-functions/_crystal"
+	rm -f "$(DESTDIR)$(DATADIR)/bash-completion/completions/crystal"
+	rm -f "$(DESTDIR)$(DATADIR)/zsh/site-functions/_crystal"
+	rm -f "$(DESTDIR)$(DATADIR)/fish/vendor_completions.d/crystal.fish"
 
 .PHONY: install_docs
 install_docs: docs ## Install docs at DESTDIR
-	$(INSTALL) -d -m 0755 $(DATADIR)
+	$(INSTALL) -d -m 0755 $(DESTDIR)$(DOCDIR)
 
-	cp -R -P -p docs "$(DATADIR)/docs"
-	cp -R -P -p samples "$(DATADIR)/examples"
+	cp -R -P -p docs "$(DESTDIR)$(DOCDIR)/docs"
+	cp -R -P -p samples "$(DESTDIR)$(DOCDIR)/examples"
 
 .PHONY: uninstall_docs
 uninstall_docs: ## Uninstall docs from DESTDIR
-	rm -rf "$(DATADIR)/docs"
-	rm -rf "$(DATADIR)/examples"
+	rm -rf "$(DESTDIR)$(DOCDIR)/docs"
+	rm -rf "$(DESTDIR)$(DOCDIR)/examples"
 
 $(O)/all_spec$(EXE): $(DEPS) $(SOURCES) $(SPEC_SOURCES)
 	$(call check_llvm_config)
@@ -250,10 +262,15 @@ $(O)/$(CRYSTAL_BIN): $(DEPS) $(SOURCES)
 
 $(LLVM_EXT_OBJ): $(LLVM_EXT_DIR)/llvm_ext.cc
 	$(call check_llvm_config)
-	$(CXX) -c $(CXXFLAGS) -o $@ $< $(shell $(LLVM_CONFIG) --cxxflags)
+	$(CXX) -c $(CXXFLAGS) -o $@ $< $(if $(LLVM_CONFIG),$(shell $(LLVM_CONFIG) --cxxflags))
+
+man/: $(MAN1PAGES)
 
 man/%.gz: man/%
 	gzip -c -9 $< > $@
+
+man/%.1: doc/man/%.adoc
+	SOURCE_DATE_EPOCH=$(SOURCE_DATE_EPOCH) asciidoctor -a crystal_version=$(CRYSTAL_VERSION) $< -b manpage -o $@
 
 .PHONY: clean
 clean: clean_crystal ## Clean up built directories and files

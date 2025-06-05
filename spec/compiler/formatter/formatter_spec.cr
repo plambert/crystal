@@ -756,6 +756,13 @@ describe Crystal::Formatter do
     CRYSTAL
 
   assert_format <<-CRYSTAL
+    def foo(
+      a, b,
+    )
+    end
+    CRYSTAL
+
+  assert_format <<-CRYSTAL
     macro foo(
       a,
       *b,
@@ -1902,12 +1909,12 @@ describe Crystal::Formatter do
 
   assert_format "<<-FOO\nFOO"
 
-  assert_format "<<-FOO\n#{"foo"}\nFOO"
-  assert_format "<<-FOO\n#{"foo"}bar\nFOO"
-  assert_format "<<-FOO\nbar#{"foo"}\nFOO"
-  assert_format "<<-FOO\nbar#{"foo"}bar\nFOO"
-  assert_format "<<-FOO\nfoo\n#{"foo"}\nFOO"
-  assert_format "<<-FOO\nfoo\n#{1}\nFOO"
+  assert_format %(<<-FOO\n\#{"foo"}\nFOO)
+  assert_format %(<<-FOO\n\#{"foo"}bar\nFOO)
+  assert_format %(<<-FOO\nbar\#{"foo"}\nFOO)
+  assert_format %(<<-FOO\nbar\#{"foo"}bar\nFOO)
+  assert_format %(<<-FOO\nfoo\n\#{"foo"}\nFOO)
+  assert_format %(<<-FOO\nfoo\n\#{1}\nFOO)
 
   assert_format "#!shebang\n1 + 2"
 
@@ -2631,7 +2638,7 @@ describe Crystal::Formatter do
 
   assert_format <<-CRYSTAL
     1 # foo
-    / #{1} /
+    / \#{1} /
     CRYSTAL
 
   assert_format <<-CRYSTAL,
@@ -2848,6 +2855,14 @@ describe Crystal::Formatter do
 
     # doc
     def baz; end
+    CRYSTAL
+
+  # 15180
+  assert_format <<-CRYSTAL
+    x = uninitialized Foo
+    {% begin %}
+      x = foo(x)
+    {% end %}
     CRYSTAL
 
   # CVE-2021-42574

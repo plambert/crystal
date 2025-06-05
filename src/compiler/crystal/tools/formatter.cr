@@ -3132,9 +3132,9 @@ module Crystal
         when IsA
           if body.obj.is_a?(Var)
             if body.nil_check?
-              call = Call.new(nil, "nil?")
+              call = Call.new("nil?")
             else
-              call = Call.new(nil, "is_a?", body.const)
+              call = Call.new("is_a?", body.const)
             end
             accept call
           else
@@ -3143,7 +3143,7 @@ module Crystal
           end
         when RespondsTo
           if body.obj.is_a?(Var)
-            call = Call.new(nil, "responds_to?", SymbolLiteral.new(body.name.to_s))
+            call = Call.new("responds_to?", SymbolLiteral.new(body.name.to_s))
             accept call
           else
             clear_object(body)
@@ -3151,7 +3151,7 @@ module Crystal
           end
         when Cast
           if body.obj.is_a?(Var)
-            call = Call.new(nil, "as", body.to)
+            call = Call.new("as", body.to)
             accept call
           else
             clear_object(body)
@@ -3159,7 +3159,7 @@ module Crystal
           end
         when NilableCast
           if body.obj.is_a?(Var)
-            call = Call.new(nil, "as?", body.to)
+            call = Call.new("as?", body.to)
             accept call
           else
             clear_object(body)
@@ -3167,7 +3167,7 @@ module Crystal
           end
         when ReadInstanceVar
           if body.obj.is_a?(Var)
-            call = Call.new(nil, body.name)
+            call = Call.new(body.name)
             accept call
           else
             clear_object(body)
@@ -3175,7 +3175,7 @@ module Crystal
           end
         when Not
           if body.exp.is_a?(Var)
-            call = Call.new(nil, "!")
+            call = Call.new("!")
             accept call
           else
             clear_object(body)
@@ -3657,7 +3657,11 @@ module Crystal
     end
 
     def visit(node : UninitializedVar)
-      accept node.var
+      var = node.var
+
+      @vars.last.add var.name if var.is_a?(Var)
+
+      accept var
       skip_space_or_newline
       write_token " ", :OP_EQ, " "
       skip_space_or_newline
@@ -3964,31 +3968,31 @@ module Crystal
     end
 
     def visit(node : TypeOf)
-      visit Call.new(nil, "typeof", node.expressions)
+      visit Call.new("typeof", node.expressions)
     end
 
     def visit(node : SizeOf)
-      visit Call.new(nil, "sizeof", node.exp)
+      visit Call.new("sizeof", node.exp)
     end
 
     def visit(node : InstanceSizeOf)
-      visit Call.new(nil, "instance_sizeof", node.exp)
+      visit Call.new("instance_sizeof", node.exp)
     end
 
     def visit(node : AlignOf)
-      visit Call.new(nil, "alignof", node.exp)
+      visit Call.new("alignof", node.exp)
     end
 
     def visit(node : InstanceAlignOf)
-      visit Call.new(nil, "instance_alignof", node.exp)
+      visit Call.new("instance_alignof", node.exp)
     end
 
     def visit(node : OffsetOf)
-      visit Call.new(nil, "offsetof", [node.offsetof_type, node.offset])
+      visit Call.new("offsetof", [node.offsetof_type, node.offset])
     end
 
     def visit(node : PointerOf)
-      visit Call.new(nil, "pointerof", node.exp)
+      visit Call.new("pointerof", node.exp)
     end
 
     def visit(node : Underscore)
@@ -5107,7 +5111,7 @@ module Crystal
         next if doc_comment.start_line > doc_comment.end_line
 
         first_line = lines[doc_comment.start_line]
-        sharp_index = first_line.index('#').not_nil!
+        sharp_index = first_line.index!('#')
 
         comment = String.build do |str|
           (doc_comment.start_line..doc_comment.end_line).each do |i|

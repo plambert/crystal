@@ -1,9 +1,9 @@
-require "c/stdlib"
 require "c/string"
 require "crystal/small_deque"
 {% unless flag?(:without_iconv) %}
   require "crystal/iconv"
 {% end %}
+require "float/fast_float"
 
 # A `String` represents an immutable sequence of UTF-8 characters.
 #
@@ -525,27 +525,52 @@ class String
     gen_to_ UInt128, UInt128
   end
 
-  # :nodoc:
-  CHAR_TO_DIGIT = begin
-    table = StaticArray(Int8, 256).new(-1_i8)
-    10_i8.times do |i|
-      table.to_unsafe[48 + i] = i
-    end
-    26_i8.times do |i|
-      table.to_unsafe[65 + i] = i + 10
-      table.to_unsafe[97 + i] = i + 10
-    end
-    table
-  end
+  {% if compare_versions(Crystal::VERSION, "1.16.0") >= 0 %}
+    {%
+      table = (0...256).map { -1 }
+      (0...10).each do |i|
+        table[48 + i] = i
+      end
+      (0...26).each do |i|
+        table[65 + i] = i + 10
+        table[97 + i] = i + 10
+      end
+    %}
 
-  # :nodoc:
-  CHAR_TO_DIGIT62 = begin
-    table = CHAR_TO_DIGIT.clone
-    26_i8.times do |i|
-      table.to_unsafe[65 + i] = i + 36
+    # :nodoc:
+    CHAR_TO_DIGIT = Slice(Int8).literal({{ table.splat }})
+
+    {%
+      (0...26).each do |i|
+        table[65 + i] = i + 36
+      end
+    %}
+
+    # :nodoc:
+    CHAR_TO_DIGIT62 = Slice(Int8).literal({{ table.splat }})
+  {% else %}
+    # :nodoc:
+    CHAR_TO_DIGIT = begin
+      table = StaticArray(Int8, 256).new(-1_i8)
+      10_i8.times do |i|
+        table.to_unsafe[48 + i] = i
+      end
+      26_i8.times do |i|
+        table.to_unsafe[65 + i] = i + 10
+        table.to_unsafe[97 + i] = i + 10
+      end
+      table
     end
-    table
-  end
+
+    # :nodoc:
+    CHAR_TO_DIGIT62 = begin
+      table = CHAR_TO_DIGIT.clone
+      26_i8.times do |i|
+        table.to_unsafe[65 + i] = i + 36
+      end
+      table
+    end
+  {% end %}
 
   # :nodoc:
   record ToUnsignedInfo(T),
@@ -738,10 +763,7 @@ class String
 
   # :ditto:
   def to_f64?(whitespace : Bool = true, strict : Bool = true) : Float64?
-    to_f_impl(whitespace: whitespace, strict: strict) do
-      v = LibC.strtod self, out endptr
-      {v, endptr}
-    end
+    Float::FastFloat.to_f64?(self, whitespace, strict)
   end
 
   # Same as `#to_f` but returns a Float32.
@@ -751,59 +773,7 @@ class String
 
   # Same as `#to_f?` but returns a Float32.
   def to_f32?(whitespace : Bool = true, strict : Bool = true) : Float32?
-    to_f_impl(whitespace: whitespace, strict: strict) do
-      v = LibC.strtof self, out endptr
-      {v, endptr}
-    end
-  end
-
-  private def to_f_impl(whitespace : Bool = true, strict : Bool = true, &)
-    return unless first_char = self[0]?
-    return unless whitespace || '0' <= first_char <= '9' || first_char.in?('-', '+', 'i', 'I', 'n', 'N')
-
-    v, endptr = yield
-
-    unless v.finite?
-      startptr = to_unsafe
-      if whitespace
-        while startptr.value.unsafe_chr.ascii_whitespace?
-          startptr += 1
-        end
-      end
-      if startptr.value.unsafe_chr.in?('+', '-')
-        startptr += 1
-      end
-
-      if v.nan?
-        return unless startptr.value.unsafe_chr.in?('n', 'N')
-      else
-        return unless startptr.value.unsafe_chr.in?('i', 'I')
-      end
-    end
-
-    string_end = to_unsafe + bytesize
-
-    # blank string
-    return if endptr == to_unsafe
-
-    if strict
-      if whitespace
-        while endptr < string_end && endptr.value.unsafe_chr.ascii_whitespace?
-          endptr += 1
-        end
-      end
-      # reached the end of the string
-      v if endptr == string_end
-    else
-      ptr = to_unsafe
-      if whitespace
-        while ptr < string_end && ptr.value.unsafe_chr.ascii_whitespace?
-          ptr += 1
-        end
-      end
-      # consumed some bytes
-      v if endptr > ptr
-    end
+    Float::FastFloat.to_f32?(self, whitespace, strict)
   end
 
   # Returns the `Char` at the given *index*.
@@ -1425,9 +1395,7 @@ class String
   # ```
   def downcase(io : IO, options : Unicode::CaseOptions = :none) : Nil
     each_char do |char|
-      char.downcase(options) do |res|
-        io << res
-      end
+      char.downcase(io, options)
     end
   end
 
@@ -1461,9 +1429,7 @@ class String
   # ```
   def upcase(io : IO, options : Unicode::CaseOptions = :none) : Nil
     each_char do |char|
-      char.upcase(options) do |res|
-        io << res
-      end
+      char.upcase(io, options)
     end
   end
 
@@ -1506,9 +1472,9 @@ class String
   def capitalize(io : IO, options : Unicode::CaseOptions = :none) : Nil
     each_char_with_index do |char, i|
       if i.zero?
-        char.titlecase(options) { |c| io << c }
+        char.titlecase(io, options)
       else
-        char.downcase(options) { |c| io << c }
+        char.downcase(io, options)
       end
     end
   end
@@ -1569,13 +1535,13 @@ class String
     each_char_with_index do |char, i|
       if upcase_next
         upcase_next = false
-        char.titlecase(options) { |c| io << c }
+        char.titlecase(io, options)
       elsif underscore_to_space && '_' == char
         upcase_next = true
         io << ' '
       else
         upcase_next = char.whitespace?
-        char.downcase(options) { |c| io << c }
+        char.downcase(io, options)
       end
     end
   end
@@ -2166,7 +2132,8 @@ class String
     remove_excess_left(excess_left)
   end
 
-  private def calc_excess_right
+  # :nodoc:
+  def calc_excess_right
     if single_byte_optimizable?
       i = bytesize - 1
       while i >= 0 && to_unsafe[i].unsafe_chr.ascii_whitespace?
@@ -2204,7 +2171,8 @@ class String
     bytesize - byte_index
   end
 
-  private def calc_excess_left
+  # :nodoc:
+  def calc_excess_left
     if single_byte_optimizable?
       excess_left = 0
       # All strings end with '\0', and it's not a whitespace
@@ -3088,8 +3056,18 @@ class String
   # "abcdef".compare("ABCDEF", case_insensitive: true) == 0 # => true
   # ```
   def ==(other : self) : Bool
+    # Quick pointer comparison if both strings are identical references
     return true if same?(other)
-    return false unless bytesize == other.bytesize
+
+    # If the bytesize differs, they cannot be equal
+    return false if bytesize != other.bytesize
+
+    # If the character size of both strings differs, they cannot be equal.
+    # We need to exclude the case that @length of either string might not have
+    # been calculated (indicated by `0`).
+    return false if @length != other.@length && @length != 0 && other.@length != 0
+
+    # All meta data matches up, so we need to compare byte-by-byte.
     to_unsafe.memcmp(other.to_unsafe, bytesize) == 0
   end
 
@@ -3876,6 +3854,27 @@ class String
     nil
   end
 
+  # Returns the byte index of the regex *pattern* in the string, or `nil` if the pattern does not find a match.
+  # If *offset* is present, it defines the position to start the search.
+  #
+  # Negative *offset* can be used to start the search from the end of the string.
+  #
+  # ```
+  # "hello world".byte_index(/o/)             # => 4
+  # "hello world".byte_index(/o/, offset: 4)  # => 4
+  # "hello world".byte_index(/o/, offset: 5)  # => 7
+  # "hello world".byte_index(/o/, offset: -1) # => nil
+  # "hello world".byte_index(/y/)             # => nil
+  # ```
+  def byte_index(pattern : Regex, offset = 0, options : Regex::MatchOptions = Regex::MatchOptions::None) : Int32?
+    offset += bytesize if offset < 0
+    return if offset < 0
+
+    if match = pattern.match_at_byte_index(self, offset, options: options)
+      match.byte_begin
+    end
+  end
+
   # Returns the byte index of a char index, or `nil` if out of bounds.
   #
   # It is valid to pass `#size` to *index*, and in this case the answer
@@ -4427,7 +4426,7 @@ class String
       end
 
       if first
-        char.downcase(options) { |c| io << c }
+        char.downcase(io, options)
       elsif last_is_downcase && upcase
         if mem
           # This is the case of A1Bcd, we need to put 'mem' (not to need to convert as downcase
@@ -4439,7 +4438,7 @@ class String
         # This is the case of AbcDe, we need to put an underscore before the 'D'
         #                        ^
         io << '_'
-        char.downcase(options) { |c| io << c }
+        char.downcase(io, options)
       elsif (last_is_upcase || last_is_digit) && (upcase || digit)
         # This is the case of 1) A1Bcd, 2) A1BCd or 3) A1B_cd:if the next char is upcase (case 1) we need
         #                          ^         ^           ^
@@ -4449,7 +4448,7 @@ class String
         # 3) we need to append this char as downcase and then a single underscore
         if mem
           # case 2
-          mem.downcase(options) { |c| io << c }
+          mem.downcase(io, options)
         end
         mem = char
       else
@@ -4460,11 +4459,11 @@ class String
             # case 1
             io << '_'
           end
-          mem.downcase(options) { |c| io << c }
+          mem.downcase(io, options)
           mem = nil
         end
 
-        char.downcase(options) { |c| io << c }
+        char.downcase(io, options)
       end
 
       last_is_downcase = downcase
@@ -4473,7 +4472,7 @@ class String
       first = false
     end
 
-    mem.downcase(options) { |c| io << c } if mem
+    mem.downcase(io, options) if mem
   end
 
   # Converts underscores to camelcase boundaries.
@@ -4507,14 +4506,14 @@ class String
     each_char do |char|
       if first
         if lower
-          char.downcase(options) { |c| io << c }
+          char.downcase(io, options)
         else
-          char.titlecase(options) { |c| io << c }
+          char.titlecase(io, options)
         end
       elsif char == '_'
         last_is_underscore = true
       elsif last_is_underscore
-        char.titlecase(options) { |c| io << c }
+        char.titlecase(io, options)
         last_is_underscore = false
       else
         io << char
@@ -5583,6 +5582,36 @@ class String
       raise ArgumentError.new("String #{name}contains null byte")
     end
     self
+  end
+
+  # Returns `self` if it starts with the given *prefix*. Otherwise, returns a new
+  # `String` with the *prefix* prepended.
+  #
+  # ```
+  # "llo!".ensure_prefix("He")   # => "Hello!"
+  # "Hello!".ensure_prefix("He") # => "Hello!"
+  # "ello".ensure_prefix('H')    # => "Hello!"
+  # "Hello!".ensure_prefix('H')  # => "Hello!"
+  # ```
+  def ensure_prefix(prefix : String | Char) : self
+    return self if starts_with?(prefix)
+
+    "#{prefix}#{self}"
+  end
+
+  # Returns `self` if it ends with the given *suffix*. Otherwise, returns a new
+  # `String` with the *suffix* appended.
+  #
+  # ```
+  # "Hell".ensure_suffix("o!")   # => "Hello!"
+  # "Hello!".ensure_suffix("o!") # => "Hello!"
+  # "Hello".ensure_suffix('!')   # => "Hello!"
+  # "Hello!".ensure_suffix('!')  # => "Hello!"
+  # ```
+  def ensure_suffix(suffix : String | Char) : self
+    return self if ends_with?(suffix)
+
+    "#{self}#{suffix}"
   end
 
   # :nodoc:

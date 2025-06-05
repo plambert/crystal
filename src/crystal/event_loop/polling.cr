@@ -2,6 +2,7 @@
 abstract class Crystal::EventLoop::Polling < Crystal::EventLoop; end
 
 require "./polling/*"
+require "./timers"
 
 module Crystal::System::FileDescriptor
   # user data (generation index for the arena)
@@ -55,6 +56,14 @@ end
 # before suspending the fiber, then after resume it will raise
 # `IO::TimeoutError` if the event timed out, and continue otherwise.
 abstract class Crystal::EventLoop::Polling < Crystal::EventLoop
+  def self.default_file_blocking?
+    false
+  end
+
+  def self.default_socket_blocking?
+    false
+  end
+
   # The generational arena:
   #
   # 1. decorrelates the fd from the IO since the evloop only really cares about
@@ -96,7 +105,7 @@ abstract class Crystal::EventLoop::Polling < Crystal::EventLoop
   end
 
   @lock = SpinLock.new # protects parallel accesses to @timers
-  @timers = Timers.new
+  @timers = Timers(Event).new
 
   # reset the mutexes since another thread may have acquired the lock of one
   # event loop, which would prevent closing file descriptors for example.
@@ -111,25 +120,70 @@ abstract class Crystal::EventLoop::Polling < Crystal::EventLoop
     end
   {% end %}
 
-  # NOTE: thread unsafe
+  # thread unsafe
   def run(blocking : Bool) : Bool
     system_run(blocking) do |fiber|
-      Crystal::Scheduler.enqueue(fiber)
+      {% if flag?(:execution_context) %}
+        fiber.execution_context.enqueue(fiber)
+      {% else %}
+        Crystal::Scheduler.enqueue(fiber)
+      {% end %}
     end
     true
   end
 
+  {% if flag?(:execution_context) %}
+    # thread unsafe
+    def run(queue : Fiber::List*, blocking : Bool) : Nil
+      system_run(blocking) { |fiber| queue.value.push(fiber) }
+    end
+  {% end %}
+
   # fiber interface, see Crystal::EventLoop
 
-  def create_resume_event(fiber : Fiber) : FiberEvent
-    FiberEvent.new(self, fiber, :sleep)
+  def sleep(duration : ::Time::Span) : Nil
+    event = Event.new(:sleep, Fiber.current, timeout: duration)
+    add_timer(pointerof(event))
+    Fiber.suspend
+
+    # safety check
+    return if event.timed_out?
+
+    # try to avoid a double resume if possible, but another thread might be
+    # running the evloop and dequeue the event in parallel, so a "can't resume
+    # dead fiber" can still happen in a MT execution context.
+    delete_timer(pointerof(event))
+    raise "BUG: #{event.fiber} called sleep but was manually resumed before the timer expired!"
   end
 
   def create_timeout_event(fiber : Fiber) : FiberEvent
-    FiberEvent.new(self, fiber, :select_timeout)
+    FiberEvent.new(:select_timeout, fiber)
   end
 
   # file descriptor interface, see Crystal::EventLoop::FileDescriptor
+
+  def pipe(read_blocking : Bool?, write_blocking : Bool?) : {IO::FileDescriptor, IO::FileDescriptor}
+    r, w = System::FileDescriptor.system_pipe
+    {
+      IO::FileDescriptor.new(r, !!read_blocking),
+      IO::FileDescriptor.new(w, !!write_blocking),
+    }
+  end
+
+  def open(path : String, flags : Int32, permissions : File::Permissions, blocking : Bool?) : {System::FileDescriptor::Handle, Bool} | Errno
+    path.check_no_null_byte
+
+    fd = LibC.open(path, flags | LibC::O_CLOEXEC, permissions)
+    return Errno.value if fd == -1
+
+    blocking = !System::File.special_type?(fd) if blocking.nil?
+    unless blocking
+      status_flags = System::FileDescriptor.fcntl(fd, LibC::F_GETFL)
+      System::FileDescriptor.fcntl(fd, LibC::F_SETFL, status_flags | LibC::O_NONBLOCK)
+    end
+
+    {fd, blocking}
+  end
 
   def read(file_descriptor : System::FileDescriptor, slice : Bytes) : Int32
     size = evented_read(file_descriptor, slice, file_descriptor.@read_timeout)
@@ -142,6 +196,12 @@ abstract class Crystal::EventLoop::Polling < Crystal::EventLoop
       end
     else
       size.to_i32
+    end
+  end
+
+  def wait_readable(file_descriptor : System::FileDescriptor) : Nil
+    wait_readable(file_descriptor, file_descriptor.@read_timeout) do
+      raise IO::TimeoutError.new
     end
   end
 
@@ -159,20 +219,49 @@ abstract class Crystal::EventLoop::Polling < Crystal::EventLoop
     end
   end
 
-  def close(file_descriptor : System::FileDescriptor) : Nil
-    evented_close(file_descriptor)
+  def wait_writable(file_descriptor : System::FileDescriptor) : Nil
+    wait_writable(file_descriptor, file_descriptor.@write_timeout) do
+      raise IO::TimeoutError.new
+    end
   end
 
-  def remove(file_descriptor : System::FileDescriptor) : Nil
+  def reopened(file_descriptor : System::FileDescriptor) : Nil
+    resume_all(file_descriptor)
+  end
+
+  def close(file_descriptor : System::FileDescriptor) : Nil
+    # perform cleanup before LibC.close. Using a file descriptor after it has
+    # been closed is never defined and can always lead to undefined results
+    resume_all(file_descriptor)
+    file_descriptor.file_descriptor_close
+  end
+
+  protected def self.remove_impl(file_descriptor : System::FileDescriptor) : Nil
     internal_remove(file_descriptor)
   end
 
   # socket interface, see Crystal::EventLoop::Socket
 
+  def socket(family : ::Socket::Family, type : ::Socket::Type, protocol : ::Socket::Protocol, blocking : Bool?) : {::Socket::Handle, Bool}
+    socket = System::Socket.socket(family, type, protocol, !!blocking)
+    {socket, !!blocking}
+  end
+
+  def socketpair(type : ::Socket::Type, protocol : ::Socket::Protocol) : Tuple({::Socket::Handle, ::Socket::Handle}, Bool)
+    socket = System::Socket.socketpair(type, protocol, blocking: false)
+    {socket, false}
+  end
+
   def read(socket : ::Socket, slice : Bytes) : Int32
     size = evented_read(socket, slice, socket.@read_timeout)
     raise IO::Error.from_errno("read", target: socket) if size == -1
     size
+  end
+
+  def wait_readable(socket : ::Socket) : Nil
+    wait_readable(socket, socket.@read_timeout) do
+      raise IO::TimeoutError.new
+    end
   end
 
   def write(socket : ::Socket, slice : Bytes) : Int32
@@ -181,11 +270,17 @@ abstract class Crystal::EventLoop::Polling < Crystal::EventLoop
     size
   end
 
-  def accept(socket : ::Socket) : ::Socket::Handle?
+  def wait_writable(socket : ::Socket) : Nil
+    wait_writable(socket, socket.@write_timeout) do
+      raise IO::TimeoutError.new
+    end
+  end
+
+  def accept(socket : ::Socket) : {::Socket::Handle, Bool}?
     loop do
       client_fd =
         {% if LibC.has_method?(:accept4) %}
-          LibC.accept4(socket.fd, nil, nil, LibC::SOCK_CLOEXEC)
+          LibC.accept4(socket.fd, nil, nil, LibC::SOCK_CLOEXEC | LibC::SOCK_NONBLOCK)
         {% else %}
           # we may fail to set FD_CLOEXEC between `accept` and `fcntl` but we
           # can't call `Crystal::System::Socket.lock_read` because the socket
@@ -196,11 +291,14 @@ abstract class Crystal::EventLoop::Polling < Crystal::EventLoop
           # could change the socket back to blocking mode between the condition
           # check and the `accept` call.
           LibC.accept(socket.fd, nil, nil).tap do |fd|
-            System::Socket.fcntl(fd, LibC::F_SETFD, LibC::FD_CLOEXEC) unless fd == -1
+            unless fd == -1
+              System::Socket.fcntl(fd, LibC::F_SETFD, LibC::FD_CLOEXEC)
+              System::Socket.fcntl(fd, LibC::F_SETFL, System::Socket.fcntl(fd, LibC::F_GETFL) | LibC::O_NONBLOCK)
+            end
           end
         {% end %}
 
-      return client_fd unless client_fd == -1
+      return {client_fd, false} unless client_fd == -1
       return if socket.closed?
 
       if Errno.value == Errno::EAGAIN
@@ -263,10 +361,13 @@ abstract class Crystal::EventLoop::Polling < Crystal::EventLoop
   end
 
   def close(socket : ::Socket) : Nil
-    evented_close(socket)
+    # perform cleanup before LibC.close. Using a file descriptor after it has
+    # been closed is never defined and can always lead to undefined results
+    resume_all(socket)
+    socket.socket_close
   end
 
-  def remove(socket : ::Socket) : Nil
+  protected def self.remove_impl(socket : ::Socket) : Nil
     internal_remove(socket)
   end
 
@@ -296,19 +397,27 @@ abstract class Crystal::EventLoop::Polling < Crystal::EventLoop
     end
   end
 
-  protected def evented_close(io)
+  private def resume_all(io)
     return unless (index = io.__evloop_data).valid?
 
     Polling.arena.free(index) do |pd|
       pd.value.@readers.ready_all do |event|
         pd.value.@event_loop.try(&.unsafe_resume_io(event) do |fiber|
-          Crystal::Scheduler.enqueue(fiber)
+          {% if flag?(:execution_context) %}
+            fiber.execution_context.enqueue(fiber)
+          {% else %}
+            Crystal::Scheduler.enqueue(fiber)
+          {% end %}
         end)
       end
 
       pd.value.@writers.ready_all do |event|
         pd.value.@event_loop.try(&.unsafe_resume_io(event) do |fiber|
-          Crystal::Scheduler.enqueue(fiber)
+          {% if flag?(:execution_context) %}
+            fiber.execution_context.enqueue(fiber)
+          {% else %}
+            Crystal::Scheduler.enqueue(fiber)
+          {% end %}
         end)
       end
 
@@ -316,7 +425,7 @@ abstract class Crystal::EventLoop::Polling < Crystal::EventLoop
     end
   end
 
-  private def internal_remove(io)
+  private def self.internal_remove(io)
     return unless (index = io.__evloop_data).valid?
 
     Polling.arena.free(index) do |pd|
@@ -363,6 +472,9 @@ abstract class Crystal::EventLoop::Polling < Crystal::EventLoop
       event = Event.new(type, Fiber.current, index, timeout)
 
       return false unless Polling.arena.get?(index) do |pd|
+                            unless pd.value.owned_by?(self)
+                              pd.value.take_ownership(self, io.fd, index)
+                            end
                             yield pd, pointerof(event)
                           end
     else
@@ -492,8 +604,7 @@ abstract class Crystal::EventLoop::Polling < Crystal::EventLoop
       return unless select_action.time_expired?
       fiber.@timeout_event.as(FiberEvent).clear
     when .sleep?
-      # cleanup
-      fiber.@resume_event.as(FiberEvent).clear
+      event.value.timed_out!
     else
       raise RuntimeError.new("BUG: unexpected event in timers: #{event.value}%s\n")
     end
@@ -514,7 +625,7 @@ abstract class Crystal::EventLoop::Polling < Crystal::EventLoop
   private abstract def system_run(blocking : Bool, & : Fiber ->) : Nil
 
   # Add *fd* to the polling system, setting *index* as user data.
-  protected abstract def system_add(fd : Int32, index : Index) : Nil
+  protected abstract def system_add(fd : Int32, index : Arena::Index) : Nil
 
   # Remove *fd* from the polling system. Must raise a `RuntimeError` on error.
   #
